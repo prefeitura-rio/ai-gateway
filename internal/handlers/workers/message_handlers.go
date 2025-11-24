@@ -1039,8 +1039,10 @@ func executeCallback(ctx context.Context, deps *MessageHandlerDependencies, mess
 	}
 
 	// Include original metadata from queue message
+	var metadata map[string]interface{}
 	if queueMsg != nil && queueMsg.Metadata != nil {
 		processedData.Metadata = queueMsg.Metadata
+		metadata = queueMsg.Metadata
 		callbackLogger.WithField("metadata_keys", len(queueMsg.Metadata)).Debug("Including original metadata in callback")
 	}
 
@@ -1052,6 +1054,7 @@ func executeCallback(ctx context.Context, deps *MessageHandlerDependencies, mess
 		Error:       nil,
 		Timestamp:   time.Now().UTC().Format(time.RFC3339),
 		ProcessedAt: processedData.ProcessedAt,
+		Metadata:    metadata,
 	}
 
 	// Execute the callback with retry logic
@@ -1082,6 +1085,7 @@ func executeCallbackOnError(ctx context.Context, deps *MessageHandlerDependencie
 	errorMessage := processErr.Error()
 
 	// Create callback payload with error information
+	var metadata map[string]interface{}
 	payload := models.CallbackPayload{
 		MessageID: messageID,
 		Status:    "failed", // Status indicates failure
@@ -1095,6 +1099,7 @@ func executeCallbackOnError(ctx context.Context, deps *MessageHandlerDependencie
 		Error:       &errorMessage, // Error description
 		Timestamp:   time.Now().UTC().Format(time.RFC3339),
 		ProcessedAt: messageID,
+		Metadata:    nil, // Will be set below
 	}
 
 	// Include original metadata even on error
@@ -1102,6 +1107,8 @@ func executeCallbackOnError(ctx context.Context, deps *MessageHandlerDependencie
 		if data, ok := payload.Data.(models.ProcessedMessageData); ok {
 			data.Metadata = queueMsg.Metadata
 			payload.Data = data
+			metadata = queueMsg.Metadata
+			payload.Metadata = metadata
 			callbackLogger.WithField("metadata_keys", len(queueMsg.Metadata)).Debug("Including original metadata in error callback")
 		}
 	}

@@ -119,12 +119,13 @@ func IsValidUUID(u string) bool {
 
 // CallbackPayload represents the payload sent to callback URLs
 type CallbackPayload struct {
-	MessageID   string      `json:"message_id"`
-	Status      string      `json:"status"`
-	Data        interface{} `json:"data,omitempty"`
-	Error       *string     `json:"error,omitempty"`
-	Timestamp   string      `json:"timestamp"`
-	ProcessedAt string      `json:"processed_at"`
+	MessageID   string                 `json:"message_id"`
+	Status      string                 `json:"status"`
+	Data        interface{}            `json:"data,omitempty"`
+	Error       *string                `json:"error,omitempty"`
+	Timestamp   string                 `json:"timestamp"`
+	ProcessedAt string                 `json:"processed_at"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // CallbackInfo represents callback metadata stored in Redis
