@@ -73,6 +73,7 @@ load-tests/charts/
 # Local development
 .claude
 CLAUDE.md
+PR_DESCRIPTION.md
 
 # Docker
 .dockerignore.bak

@@ -156,10 +156,16 @@ func (r *RabbitMQService) setupTopology() error {
 		return fmt.Errorf("failed to declare user messages queue: %w", err)
 	}
 
+	// Declare DANFE processing queue
+	if err := r.declareQueueWithDLX("danfe_processing"); err != nil {
+		return fmt.Errorf("failed to declare DANFE processing queue: %w", err)
+	}
+
 	// Declare dead letter queues
 	queues := []string{
 		r.config.RabbitMQ.UserQueue,
 		r.config.RabbitMQ.UserMessagesQueue,
+		"danfe_processing",
 	}
 
 	for _, queue := range queues {
