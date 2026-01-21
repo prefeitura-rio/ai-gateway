@@ -156,16 +156,26 @@ func (r *RabbitMQService) setupTopology() error {
 		return fmt.Errorf("failed to declare user messages queue: %w", err)
 	}
 
-	// Declare dead letter queues
-	queues := []string{
-		r.config.RabbitMQ.UserQueue,
-		r.config.RabbitMQ.UserMessagesQueue,
+	// Declare DANFE processing queue
+	if err := r.declareQueueWithDLX("danfe_processing"); err != nil {
+		return fmt.Errorf("failed to declare DANFE processing queue: %w", err)
 	}
 
-	for _, queue := range queues {
-		if err := r.declareDLQ(queue + "_dlq"); err != nil {
-			return fmt.Errorf("failed to declare DLQ for %s: %w", queue, err)
-		}
+	// Declare dead letter queues
+	if err := r.declareDLQ(r.config.RabbitMQ.UserQueue+"_dlq", nil); err != nil {
+		return fmt.Errorf("failed to declare DLQ for %s: %w", r.config.RabbitMQ.UserQueue, err)
+	}
+
+	if err := r.declareDLQ(r.config.RabbitMQ.UserMessagesQueue+"_dlq", nil); err != nil {
+		return fmt.Errorf("failed to declare DLQ for %s: %w", r.config.RabbitMQ.UserMessagesQueue, err)
+	}
+
+	// DANFE DLQ with 48 hours TTL
+	danfeDLQArgs := amqp.Table{
+		"x-message-ttl": int32(172800000), // 48 hours in milliseconds
+	}
+	if err := r.declareDLQ("danfe_processing_dlq", danfeDLQArgs); err != nil {
+		return fmt.Errorf("failed to declare DLQ for danfe_processing: %w", err)
 	}
 
 	r.logger.Info("RabbitMQ topology setup completed")
@@ -202,15 +212,15 @@ func (r *RabbitMQService) declareQueueWithDLX(queueName string) error {
 	)
 }
 
-// declareDLQ declares a dead letter queue
-func (r *RabbitMQService) declareDLQ(queueName string) error {
+// declareDLQ declares a dead letter queue with optional arguments (e.g., TTL)
+func (r *RabbitMQService) declareDLQ(queueName string, args amqp.Table) error {
 	_, err := r.channel.QueueDeclare(
 		queueName, // name
 		true,      // durable
 		false,     // delete when unused
 		false,     // exclusive
 		false,     // no-wait
-		nil,       // arguments
+		args,      // arguments (can include x-message-ttl, etc.)
 	)
 	if err != nil {
 		return err

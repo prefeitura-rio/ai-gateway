@@ -16,6 +16,15 @@ type UserWebhookRequest struct {
 	CallbackURL     *string                `json:"callback_url,omitempty" binding:"omitempty,url" example:"https://example.com/webhook/callback"`
 }
 
+// DanfeEnqueueRequest represents the request payload for DANFE enqueue endpoint
+type DanfeEnqueueRequest struct {
+	UserNumber  string                 `json:"user_number" binding:"required" example:"5521999999999"`
+	Message     string                 `json:"message" binding:"required" example:"gs://bucket/file.pdf"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Provider    *string                `json:"provider,omitempty" example:"vertex_ai"`
+	CallbackURL *string                `json:"callback_url,omitempty" binding:"omitempty,url" example:"https://example.com/webhook/callback"`
+}
+
 // WebhookResponse represents the response for webhook endpoints (matches Python API)
 type WebhookResponse struct {
 	MessageID       string `json:"message_id" example:"123e4567-e89b-12d3-a456-426614174000"`
