@@ -187,7 +187,7 @@ func (r *RabbitMQService) declareQueueWithDLX(queueName string) error {
 	args := amqp.Table{
 		"x-dead-letter-exchange":    r.config.RabbitMQ.DLXExchange,
 		"x-dead-letter-routing-key": queueName + "_dlq",
-		"x-message-ttl":             300000, // 5 minutes TTL
+		"x-message-ttl":             1200000, // 20 minutes TTL
 	}
 
 	_, err := r.channel.QueueDeclare(
