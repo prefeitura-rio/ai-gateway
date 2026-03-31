@@ -44,8 +44,8 @@ func NewConsumerManager(logger *logrus.Logger) *ConsumerManager {
 
 // ConsumeMessages implements MessageConsumer interface
 func (r *RabbitMQService) ConsumeMessages(ctx context.Context, queueName string, handler MessageHandler) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
 	if !r.isConnected {
 		return fmt.Errorf("RabbitMQ connection is not available")
@@ -85,8 +85,8 @@ func (r *RabbitMQService) ConsumeMessages(ctx context.Context, queueName string,
 
 // StartConsumer implements MessageConsumer interface with concurrency support
 func (r *RabbitMQService) StartConsumer(ctx context.Context, queueName string, concurrency int, handler MessageHandler) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
 	if !r.isConnected {
 		return fmt.Errorf("RabbitMQ connection is not available")
@@ -285,6 +285,7 @@ func (c *Consumer) processMessageWithRetry(ctx context.Context, msg amqp.Deliver
 }
 
 // publishRetryMessage publishes a message for retry with delay
+// This method properly acquires the mutex to ensure thread-safe channel access
 func (c *Consumer) publishRetryMessage(originalMsg amqp.Delivery, retryCount int64, delay time.Duration, logger *logrus.Entry) {
 	// Prepare headers with retry information
 	headers := amqp.Table{
@@ -299,6 +300,16 @@ func (c *Consumer) publishRetryMessage(originalMsg amqp.Delivery, retryCount int
 				headers[k] = v
 			}
 		}
+	}
+
+	// Acquire mutex before channel operation - AMQP channels are NOT thread-safe
+	c.rabbitMQ.mutex.Lock()
+	defer c.rabbitMQ.mutex.Unlock()
+
+	// Check if still connected before attempting to publish
+	if !c.rabbitMQ.isConnected {
+		logger.Error("Failed to publish retry message: RabbitMQ not connected")
+		return
 	}
 
 	// Publish retry message
@@ -318,7 +329,10 @@ func (c *Consumer) publishRetryMessage(originalMsg amqp.Delivery, retryCount int
 	)
 
 	if err != nil {
+		c.rabbitMQ.recordFailure()
 		logger.WithError(err).Error("Failed to publish retry message")
+	} else {
+		c.rabbitMQ.recordSuccess()
 	}
 }
 
