@@ -26,7 +26,6 @@ const (
 type PooledChannel struct {
 	channel *amqp.Channel
 	mutex   sync.Mutex
-	inUse   bool
 }
 
 // ChannelPool manages a pool of AMQP channels for concurrent publishing
@@ -124,18 +123,20 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 
 // checkCircuitBreaker checks if the circuit breaker allows the operation
 func (r *RabbitMQService) checkCircuitBreaker() error {
-	r.circuitMutex.RLock()
-	defer r.circuitMutex.RUnlock()
+	r.circuitMutex.Lock()
+	defer r.circuitMutex.Unlock()
 
 	switch r.circuitState {
 	case CircuitOpen:
 		if time.Now().After(r.circuitOpenUntil) {
-			// Transition to half-open will happen on next successful operation
+			// Timeout expired — transition to half-open to test recovery
+			r.circuitState = CircuitHalfOpen
+			r.logger.Info("Circuit breaker half-open — testing recovery")
 			return nil
 		}
 		return fmt.Errorf("circuit breaker is open, rejecting request (retry after %v)", time.Until(r.circuitOpenUntil))
 	case CircuitHalfOpen:
-		// Allow limited requests through to test recovery
+		// Allow requests through to test recovery
 		return nil
 	default:
 		return nil
@@ -162,13 +163,21 @@ func (r *RabbitMQService) recordFailure() {
 	r.failureCount++
 	r.lastFailureTime = time.Now()
 
-	if r.failureCount >= r.failureThreshold && r.circuitState == CircuitClosed {
+	switch r.circuitState {
+	case CircuitHalfOpen:
+		// Recovery test failed — reopen circuit
 		r.circuitState = CircuitOpen
 		r.circuitOpenUntil = time.Now().Add(r.resetTimeout)
-		r.logger.WithFields(logrus.Fields{
-			"failure_count":      r.failureCount,
-			"circuit_open_until": r.circuitOpenUntil,
-		}).Warn("Circuit breaker opened due to repeated failures")
+		r.logger.WithField("circuit_open_until", r.circuitOpenUntil).Warn("Circuit breaker reopened after failure in half-open state")
+	case CircuitClosed:
+		if r.failureCount >= r.failureThreshold {
+			r.circuitState = CircuitOpen
+			r.circuitOpenUntil = time.Now().Add(r.resetTimeout)
+			r.logger.WithFields(logrus.Fields{
+				"failure_count":      r.failureCount,
+				"circuit_open_until": r.circuitOpenUntil,
+			}).Warn("Circuit breaker opened due to repeated failures")
+		}
 	}
 }
 
@@ -228,7 +237,6 @@ func NewChannelPool(conn *amqp.Connection, poolSize int, cfg *config.Config, log
 
 		pool.channels[i] = &PooledChannel{
 			channel: ch,
-			inUse:   false,
 		}
 	}
 
@@ -286,22 +294,20 @@ func (p *ChannelPool) Close() {
 	p.channels = nil
 }
 
-// RecreateChannels recreates all channels in the pool (called after reconnection)
+// RecreateChannels recreates all channels in the pool (called after reconnection).
+// Updates each PooledChannel in-place so in-flight publishers holding a pointer
+// to the same struct will see the new channel after acquiring the per-slot mutex.
 func (p *ChannelPool) RecreateChannels(conn *amqp.Connection) error {
 	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	p.connection = conn
+	channels := p.channels
+	p.mutex.Unlock()
 
-	// Close existing channels
-	for _, pooledCh := range p.channels {
-		if pooledCh != nil && pooledCh.channel != nil {
-			_ = pooledCh.channel.Close()
+	for i, pooledCh := range channels {
+		if pooledCh == nil {
+			continue
 		}
-	}
 
-	// Recreate channels
-	for i := 0; i < p.poolSize; i++ {
 		ch, err := conn.Channel()
 		if err != nil {
 			return fmt.Errorf("failed to recreate channel %d: %w", i, err)
@@ -312,9 +318,14 @@ func (p *ChannelPool) RecreateChannels(conn *amqp.Connection) error {
 			return fmt.Errorf("failed to set QoS for channel %d: %w", i, err)
 		}
 
-		p.channels[i] = &PooledChannel{
-			channel: ch,
-			inUse:   false,
+		// Lock the slot so any in-flight publish finishes before we swap the channel
+		pooledCh.mutex.Lock()
+		old := pooledCh.channel
+		pooledCh.channel = ch
+		pooledCh.mutex.Unlock()
+
+		if old != nil {
+			_ = old.Close()
 		}
 	}
 
@@ -847,63 +858,26 @@ func (r *RabbitMQService) reconnect() {
 	r.logger.WithField("max_retries", maxRetries).Error("Failed to reconnect to RabbitMQ after maximum retries")
 }
 
-// HealthCheck implements the HealthChecker interface with proper timeout handling
+// HealthCheck implements the HealthChecker interface
 func (r *RabbitMQService) HealthCheck(ctx context.Context) error {
 	// Check circuit breaker first - if open, fail fast
 	if r.IsCircuitOpen() {
 		return fmt.Errorf("circuit breaker is open, RabbitMQ health check skipped")
 	}
 
-	// Use a channel to implement timeout for the health check
-	resultChan := make(chan error, 1)
+	// Read connection state under a brief lock — no I/O while holding the mutex
+	r.mutex.Lock()
+	connected := r.isConnected
+	conn := r.connection
+	r.mutex.Unlock()
 
-	go func() {
-		r.mutex.Lock()
-		defer r.mutex.Unlock()
-
-		if !r.isConnected || r.connection == nil || r.connection.IsClosed() {
-			resultChan <- fmt.Errorf("RabbitMQ connection is not available")
-			return
-		}
-
-		// Try to declare a temporary queue to test connection
-		tempQueue := fmt.Sprintf("health_check_%d", time.Now().UnixNano())
-		_, err := r.channel.QueueDeclare(
-			tempQueue, // name
-			false,     // durable
-			true,      // delete when unused
-			true,      // exclusive
-			false,     // no-wait
-			nil,       // arguments
-		)
-
-		if err != nil {
-			resultChan <- fmt.Errorf("RabbitMQ health check failed: %w", err)
-			return
-		}
-
-		// Clean up the temp queue
-		_, err = r.channel.QueueDelete(tempQueue, false, false, false)
-		if err != nil {
-			r.logger.WithError(err).Warn("Failed to clean up health check queue")
-		}
-
-		resultChan <- nil
-	}()
-
-	// Wait for result with timeout from context
-	select {
-	case err := <-resultChan:
-		if err != nil {
-			r.recordFailure()
-		} else {
-			r.recordSuccess()
-		}
-		return err
-	case <-ctx.Done():
+	if !connected || conn == nil || conn.IsClosed() {
 		r.recordFailure()
-		return fmt.Errorf("RabbitMQ health check timed out: %w", ctx.Err())
+		return fmt.Errorf("RabbitMQ connection is not available")
 	}
+
+	r.recordSuccess()
+	return nil
 }
 
 // GetQueueInfo returns information about a specific queue

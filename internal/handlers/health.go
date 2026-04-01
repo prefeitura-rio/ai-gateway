@@ -269,8 +269,9 @@ func (h *HealthHandler) Live(c *gin.Context) {
 			return
 		}
 
-		// Check if circuit breaker is open (indicates repeated failures)
-		systemHealth := h.healthService.CheckHealthCached(ctx)
+		// Check if circuit breaker is open (indicates repeated failures).
+		// Use context.Background() — the 1s liveness ctx may be near expiry.
+		systemHealth := h.healthService.CheckHealthCached(context.Background())
 		if systemHealth.Status == services.HealthStatusUnhealthy {
 			// Check if RabbitMQ specifically is causing issues
 			if rabbitmqHealth, exists := systemHealth.Components["rabbitmq"]; exists {
