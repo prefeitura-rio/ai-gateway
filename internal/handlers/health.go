@@ -224,13 +224,55 @@ func (h *HealthHandler) Ready(c *gin.Context) {
 //	@Accept			json
 //	@Produce		json
 //	@Success		200	{object}	map[string]interface{}	"Service is alive"
+//	@Failure		503	{object}	map[string]interface{}	"Service is deadlocked (no liveness response within timeout)"
 //	@Router			/live [get]
 func (h *HealthHandler) Live(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
+	// Basic liveness - check if we can respond at all
+	response := gin.H{
 		"status":    "alive",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"service":   "eai-gateway",
-	})
+	}
+
+	// If health service is available, perform a quick deadlock detection
+	if h.healthService != nil {
+		// Use a very short timeout — if CheckHealthCached blocks beyond 1s, treat as deadlock
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 1*time.Second)
+		defer cancel()
+
+		// Call directly; if the context expires during the call, the service is stuck
+		_ = h.healthService.CheckHealthCached(ctx)
+
+		if ctx.Err() == context.DeadlineExceeded {
+			h.logger.Error("Liveness check detected potential deadlock - health check timed out")
+			response["status"] = "deadlocked"
+			response["message"] = "Service appears to be deadlocked - health check timed out"
+			response["deadlock_detected"] = true
+			c.JSON(http.StatusServiceUnavailable, response)
+			return
+		}
+
+		// Check if circuit breaker is open using a fresh bounded context
+		cbCtx, cbCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cbCancel()
+
+		systemHealth := h.healthService.CheckHealthCached(cbCtx)
+		if systemHealth.Status == services.HealthStatusUnhealthy {
+			// Check if RabbitMQ specifically is causing issues
+			if rabbitmqHealth, exists := systemHealth.Components["rabbitmq"]; exists {
+				if details, ok := rabbitmqHealth.Details["circuit_breaker"].(map[string]interface{}); ok {
+					if isOpen, ok := details["open"].(bool); ok && isOpen {
+						response["circuit_breaker_open"] = true
+						response["message"] = "RabbitMQ circuit breaker is open"
+						// Still return 200 for liveness - circuit breaker means we're handling the failure
+						// But add info so operators can see the state
+					}
+				}
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 // DetailedHealth handles the /health/detailed endpoint for comprehensive health information
