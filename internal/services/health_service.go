@@ -23,14 +23,6 @@ const (
 	HealthStatusUnknown   HealthStatus = "unknown"
 )
 
-// LivenessState represents the liveness state of the service
-type LivenessState struct {
-	Alive              bool   `json:"alive"`
-	CircuitBreakerOpen bool   `json:"circuit_breaker_open,omitempty"`
-	Deadlocked         bool   `json:"deadlocked,omitempty"`
-	Message            string `json:"message,omitempty"`
-}
-
 // ComponentHealth represents the health of a single component
 type ComponentHealth struct {
 	Name        string                 `json:"name"`

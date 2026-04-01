@@ -224,7 +224,7 @@ func (h *HealthHandler) Ready(c *gin.Context) {
 //	@Accept			json
 //	@Produce		json
 //	@Success		200	{object}	map[string]interface{}	"Service is alive"
-//	@Failure		503	{object}	map[string]interface{}	"Service is deadlocked or unhealthy"
+//	@Failure		503	{object}	map[string]interface{}	"Service is deadlocked (no liveness response within timeout)"
 //	@Router			/live [get]
 func (h *HealthHandler) Live(c *gin.Context) {
 	// Basic liveness - check if we can respond at all
@@ -236,31 +236,14 @@ func (h *HealthHandler) Live(c *gin.Context) {
 
 	// If health service is available, perform a quick deadlock detection
 	if h.healthService != nil {
-		// Use a very short timeout for liveness check (1 second)
-		// This detects if the service is deadlocked
+		// Use a very short timeout — if CheckHealthCached blocks beyond 1s, treat as deadlock
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 1*time.Second)
 		defer cancel()
 
-		// Try to get cached health (should be instant if not deadlocked)
-		done := make(chan bool, 1)
-		var isDeadlocked bool
+		// Call directly; if the context expires during the call, the service is stuck
+		_ = h.healthService.CheckHealthCached(ctx)
 
-		go func() {
-			// This should complete almost instantly if using cache
-			_ = h.healthService.CheckHealthCached(ctx)
-			done <- true
-		}()
-
-		select {
-		case <-done:
-			// Completed successfully - not deadlocked
-			isDeadlocked = false
-		case <-ctx.Done():
-			// Timed out - likely deadlocked
-			isDeadlocked = true
-		}
-
-		if isDeadlocked {
+		if ctx.Err() == context.DeadlineExceeded {
 			h.logger.Error("Liveness check detected potential deadlock - health check timed out")
 			response["status"] = "deadlocked"
 			response["message"] = "Service appears to be deadlocked - health check timed out"
@@ -269,9 +252,11 @@ func (h *HealthHandler) Live(c *gin.Context) {
 			return
 		}
 
-		// Check if circuit breaker is open (indicates repeated failures).
-		// Use context.Background() — the 1s liveness ctx may be near expiry.
-		systemHealth := h.healthService.CheckHealthCached(context.Background())
+		// Check if circuit breaker is open using a fresh bounded context
+		cbCtx, cbCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cbCancel()
+
+		systemHealth := h.healthService.CheckHealthCached(cbCtx)
 		if systemHealth.Status == services.HealthStatusUnhealthy {
 			// Check if RabbitMQ specifically is causing issues
 			if rabbitmqHealth, exists := systemHealth.Components["rabbitmq"]; exists {

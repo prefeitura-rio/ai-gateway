@@ -65,9 +65,8 @@ type RabbitMQService struct {
 	circuitOpenUntil time.Time
 
 	// Circuit breaker configuration
-	failureThreshold   int           // Number of failures before opening circuit
-	resetTimeout       time.Duration // Time to wait before trying again (half-open)
-	healthCheckTimeout time.Duration // Timeout for health checks
+	failureThreshold int           // Number of failures before opening circuit
+	resetTimeout     time.Duration // Time to wait before trying again (half-open)
 }
 
 // MessagePublisher defines the interface for publishing messages
@@ -104,10 +103,9 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 		notifyReconnect: make(chan bool),
 
 		// Circuit breaker defaults
-		circuitState:       CircuitClosed,
-		failureThreshold:   5,
-		resetTimeout:       30 * time.Second,
-		healthCheckTimeout: 5 * time.Second,
+		circuitState:     CircuitClosed,
+		failureThreshold: 5,
+		resetTimeout:     30 * time.Second,
 	}
 
 	if err := service.connect(); err != nil {
@@ -282,16 +280,26 @@ func (p *ChannelPool) PublishWithPool(ctx context.Context, exchange, routingKey 
 // Close closes all channels in the pool
 func (p *ChannelPool) Close() {
 	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	channels := p.channels
+	p.channels = nil
+	p.mutex.Unlock()
 
-	for i, pooledCh := range p.channels {
-		if pooledCh != nil && pooledCh.channel != nil {
-			if err := pooledCh.channel.Close(); err != nil {
+	for i, pooledCh := range channels {
+		if pooledCh == nil {
+			continue
+		}
+		// Lock the slot so any in-flight publish finishes before we close the channel
+		pooledCh.mutex.Lock()
+		ch := pooledCh.channel
+		pooledCh.channel = nil
+		pooledCh.mutex.Unlock()
+
+		if ch != nil {
+			if err := ch.Close(); err != nil {
 				p.logger.WithError(err).WithField("channel_index", i).Warn("Failed to close pooled channel")
 			}
 		}
 	}
-	p.channels = nil
 }
 
 // RecreateChannels recreates all channels in the pool (called after reconnection).
@@ -576,7 +584,7 @@ func (r *RabbitMQService) PublishMessage(ctx context.Context, queueName string, 
 	r.recordSuccess()
 	r.logger.WithFields(logrus.Fields{
 		"queue":      queueName,
-		"message_id": fmt.Sprintf("%d", time.Now().UnixNano()),
+		"message_id": publishing.MessageId,
 	}).Debug("Message published successfully")
 
 	return nil
@@ -804,7 +812,9 @@ func (r *RabbitMQService) handleReconnect() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ connection lost, attempting to reconnect")
+			r.mutex.Lock()
 			r.isConnected = false
+			r.mutex.Unlock()
 			r.reconnect()
 
 		case err := <-r.notifyChanClose:
@@ -812,7 +822,9 @@ func (r *RabbitMQService) handleReconnect() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ channel lost, attempting to reconnect")
+			r.mutex.Lock()
 			r.isConnected = false
+			r.mutex.Unlock()
 			r.reconnect()
 
 		case <-r.notifyReconnect:

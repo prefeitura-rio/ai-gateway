@@ -45,13 +45,13 @@ func NewConsumerManager(logger *logrus.Logger) *ConsumerManager {
 // ConsumeMessages implements MessageConsumer interface
 func (r *RabbitMQService) ConsumeMessages(ctx context.Context, queueName string, handler MessageHandler) error {
 	r.mutex.Lock()
-	defer r.mutex.Unlock()
 
 	if !r.isConnected {
+		r.mutex.Unlock()
 		return fmt.Errorf("RabbitMQ connection is not available")
 	}
 
-	// Start consuming
+	// Start consuming — channel.Consume is not thread-safe, protect with mutex
 	msgs, err := r.channel.Consume(
 		queueName, // queue
 		"",        // consumer tag (empty = auto-generated)
@@ -62,10 +62,12 @@ func (r *RabbitMQService) ConsumeMessages(ctx context.Context, queueName string,
 		nil,       // arguments
 	)
 	if err != nil {
+		r.mutex.Unlock()
 		return fmt.Errorf("failed to register consumer for queue %s: %w", queueName, err)
 	}
 
 	r.logger.WithField("queue", queueName).Info("Started consuming messages")
+	r.mutex.Unlock() // Release before entering the long-running message loop
 
 	// Process messages
 	for {
