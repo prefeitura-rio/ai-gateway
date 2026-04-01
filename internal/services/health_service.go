@@ -303,6 +303,8 @@ func (h *HealthService) GetComponentHealth(ctx context.Context, componentName st
 type RabbitMQHealthService interface {
 	HealthCheck(ctx context.Context) error
 	IsConnected() bool
+	IsCircuitOpen() bool
+	GetCircuitState() CircuitState
 }
 
 // RabbitMQHealthChecker checks RabbitMQ connectivity
@@ -340,6 +342,21 @@ func (r *RabbitMQHealthChecker) Check(ctx context.Context) ComponentHealth {
 		return health
 	}
 
+	// Check circuit breaker state first
+	circuitOpen := r.rabbitmqService.IsCircuitOpen()
+	circuitState := r.rabbitmqService.GetCircuitState()
+	health.Details["circuit_breaker"] = map[string]interface{}{
+		"state": circuitStateToString(circuitState),
+		"open":  circuitOpen,
+	}
+
+	if circuitOpen {
+		health.Status = HealthStatusUnhealthy
+		health.Message = "RabbitMQ circuit breaker is open"
+		health.Error = "circuit breaker open due to repeated failures"
+		return health
+	}
+
 	// Perform health check
 	err := r.rabbitmqService.HealthCheck(ctx)
 	if err != nil {
@@ -366,6 +383,20 @@ func (r *RabbitMQHealthChecker) Check(ctx context.Context) ComponentHealth {
 	health.Message = "RabbitMQ is healthy"
 
 	return health
+}
+
+// circuitStateToString converts CircuitState to a human-readable string
+func circuitStateToString(state CircuitState) string {
+	switch state {
+	case CircuitClosed:
+		return "closed"
+	case CircuitOpen:
+		return "open"
+	case CircuitHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
 }
 
 // RedisHealthService interface for Redis health checking

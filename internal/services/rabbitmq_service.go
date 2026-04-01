@@ -13,20 +13,60 @@ import (
 	"github.com/prefeitura-rio/app-eai-agent-gateway/internal/config"
 )
 
+// CircuitState represents the state of the circuit breaker
+type CircuitState int
+
+const (
+	CircuitClosed   CircuitState = iota // Normal operation
+	CircuitOpen                         // Failing, reject requests immediately
+	CircuitHalfOpen                     // Testing if service recovered
+)
+
+// PooledChannel represents a channel in the pool with its own mutex
+type PooledChannel struct {
+	channel *amqp.Channel
+	mutex   sync.Mutex
+}
+
+// ChannelPool manages a pool of AMQP channels for concurrent publishing
+type ChannelPool struct {
+	channels   []*PooledChannel
+	connection *amqp.Connection
+	poolSize   int
+	roundRobin uint64
+	mutex      sync.Mutex
+	logger     *logrus.Logger
+	config     *config.Config
+}
+
 // RabbitMQService handles RabbitMQ operations with connection management
 type RabbitMQService struct {
 	config      *config.Config
 	logger      *logrus.Logger
 	connection  *amqp.Connection
 	channel     *amqp.Channel
-	mutex       sync.RWMutex
+	mutex       sync.Mutex // Changed from RWMutex to Mutex - AMQP channels are NOT thread-safe
 	isConnected bool
+
+	// Channel pool for concurrent publishing
+	channelPool *ChannelPool
 
 	// Connection monitoring
 	notifyConnClose chan *amqp.Error
 	notifyChanClose chan *amqp.Error
 	notifyReconnect chan bool
 	isShutdown      bool
+
+	// Circuit breaker state
+	circuitState     CircuitState
+	circuitMutex     sync.RWMutex
+	failureCount     int
+	lastFailureTime  time.Time
+	circuitOpenUntil time.Time
+
+	// Circuit breaker configuration
+	failureThreshold int           // Number of failures before opening circuit
+	resetTimeout     time.Duration // Time to wait before trying again (half-open)
 }
 
 // MessagePublisher defines the interface for publishing messages
@@ -61,6 +101,11 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 		config:          cfg,
 		logger:          logger,
 		notifyReconnect: make(chan bool),
+
+		// Circuit breaker defaults
+		circuitState:     CircuitClosed,
+		failureThreshold: 5,
+		resetTimeout:     30 * time.Second,
 	}
 
 	if err := service.connect(); err != nil {
@@ -74,6 +119,228 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 	return service, nil
 }
 
+// checkCircuitBreaker checks if the circuit breaker allows the operation
+func (r *RabbitMQService) checkCircuitBreaker() error {
+	r.circuitMutex.Lock()
+	defer r.circuitMutex.Unlock()
+
+	switch r.circuitState {
+	case CircuitOpen:
+		if time.Now().After(r.circuitOpenUntil) {
+			// Timeout expired — transition to half-open to test recovery
+			r.circuitState = CircuitHalfOpen
+			r.logger.Info("Circuit breaker half-open — testing recovery")
+			return nil
+		}
+		return fmt.Errorf("circuit breaker is open, rejecting request (retry after %v)", time.Until(r.circuitOpenUntil))
+	case CircuitHalfOpen:
+		// Allow requests through to test recovery
+		return nil
+	default:
+		return nil
+	}
+}
+
+// recordSuccess records a successful operation for the circuit breaker
+func (r *RabbitMQService) recordSuccess() {
+	r.circuitMutex.Lock()
+	defer r.circuitMutex.Unlock()
+
+	r.failureCount = 0
+	if r.circuitState == CircuitHalfOpen {
+		r.circuitState = CircuitClosed
+		r.logger.Info("Circuit breaker closed - service recovered")
+	}
+}
+
+// recordFailure records a failed operation for the circuit breaker
+func (r *RabbitMQService) recordFailure() {
+	r.circuitMutex.Lock()
+	defer r.circuitMutex.Unlock()
+
+	r.failureCount++
+	r.lastFailureTime = time.Now()
+
+	switch r.circuitState {
+	case CircuitHalfOpen:
+		// Recovery test failed — reopen circuit
+		r.circuitState = CircuitOpen
+		r.circuitOpenUntil = time.Now().Add(r.resetTimeout)
+		r.logger.WithField("circuit_open_until", r.circuitOpenUntil).Warn("Circuit breaker reopened after failure in half-open state")
+	case CircuitClosed:
+		if r.failureCount >= r.failureThreshold {
+			r.circuitState = CircuitOpen
+			r.circuitOpenUntil = time.Now().Add(r.resetTimeout)
+			r.logger.WithFields(logrus.Fields{
+				"failure_count":      r.failureCount,
+				"circuit_open_until": r.circuitOpenUntil,
+			}).Warn("Circuit breaker opened due to repeated failures")
+		}
+	}
+}
+
+// resetCircuitBreaker resets the circuit breaker to closed state
+func (r *RabbitMQService) resetCircuitBreaker() {
+	r.circuitMutex.Lock()
+	defer r.circuitMutex.Unlock()
+
+	r.circuitState = CircuitClosed
+	r.failureCount = 0
+	r.logger.Info("Circuit breaker reset")
+}
+
+// GetCircuitState returns the current circuit breaker state (for health checks)
+func (r *RabbitMQService) GetCircuitState() CircuitState {
+	r.circuitMutex.RLock()
+	defer r.circuitMutex.RUnlock()
+	return r.circuitState
+}
+
+// IsCircuitOpen returns true if the circuit breaker is open
+func (r *RabbitMQService) IsCircuitOpen() bool {
+	r.circuitMutex.RLock()
+	defer r.circuitMutex.RUnlock()
+	return r.circuitState == CircuitOpen && time.Now().Before(r.circuitOpenUntil)
+}
+
+// NewChannelPool creates a new channel pool
+func NewChannelPool(conn *amqp.Connection, poolSize int, cfg *config.Config, logger *logrus.Logger) (*ChannelPool, error) {
+	if poolSize <= 0 {
+		poolSize = 5 // Default pool size
+	}
+
+	pool := &ChannelPool{
+		channels:   make([]*PooledChannel, poolSize),
+		connection: conn,
+		poolSize:   poolSize,
+		logger:     logger,
+		config:     cfg,
+	}
+
+	// Create channels for the pool
+	for i := 0; i < poolSize; i++ {
+		ch, err := conn.Channel()
+		if err != nil {
+			// Close any channels we've already created
+			pool.Close()
+			return nil, fmt.Errorf("failed to create channel %d for pool: %w", i, err)
+		}
+
+		// Set QoS for fair dispatch
+		if err := ch.Qos(1, 0, false); err != nil {
+			_ = ch.Close()
+			pool.Close()
+			return nil, fmt.Errorf("failed to set QoS for channel %d: %w", i, err)
+		}
+
+		pool.channels[i] = &PooledChannel{
+			channel: ch,
+		}
+	}
+
+	logger.WithField("pool_size", poolSize).Info("Channel pool created")
+	return pool, nil
+}
+
+// AcquireChannel gets a channel from the pool using round-robin selection
+func (p *ChannelPool) AcquireChannel() (*PooledChannel, error) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if len(p.channels) == 0 {
+		return nil, fmt.Errorf("channel pool is empty")
+	}
+
+	// Round-robin selection
+	idx := int(p.roundRobin % uint64(len(p.channels)))
+	p.roundRobin++
+
+	pooledCh := p.channels[idx]
+	if pooledCh == nil || pooledCh.channel == nil {
+		return nil, fmt.Errorf("channel at index %d is nil", idx)
+	}
+
+	return pooledCh, nil
+}
+
+// PublishWithPool publishes a message using a channel from the pool
+func (p *ChannelPool) PublishWithPool(ctx context.Context, exchange, routingKey string, publishing amqp.Publishing) error {
+	pooledCh, err := p.AcquireChannel()
+	if err != nil {
+		return fmt.Errorf("failed to acquire channel from pool: %w", err)
+	}
+
+	// Lock the specific channel for this publish operation
+	pooledCh.mutex.Lock()
+	defer pooledCh.mutex.Unlock()
+
+	return pooledCh.channel.PublishWithContext(ctx, exchange, routingKey, false, false, publishing)
+}
+
+// Close closes all channels in the pool
+func (p *ChannelPool) Close() {
+	p.mutex.Lock()
+	channels := p.channels
+	p.channels = nil
+	p.mutex.Unlock()
+
+	for i, pooledCh := range channels {
+		if pooledCh == nil {
+			continue
+		}
+		// Lock the slot so any in-flight publish finishes before we close the channel
+		pooledCh.mutex.Lock()
+		ch := pooledCh.channel
+		pooledCh.channel = nil
+		pooledCh.mutex.Unlock()
+
+		if ch != nil {
+			if err := ch.Close(); err != nil {
+				p.logger.WithError(err).WithField("channel_index", i).Warn("Failed to close pooled channel")
+			}
+		}
+	}
+}
+
+// RecreateChannels recreates all channels in the pool (called after reconnection).
+// Updates each PooledChannel in-place so in-flight publishers holding a pointer
+// to the same struct will see the new channel after acquiring the per-slot mutex.
+func (p *ChannelPool) RecreateChannels(conn *amqp.Connection) error {
+	p.mutex.Lock()
+	p.connection = conn
+	channels := p.channels
+	p.mutex.Unlock()
+
+	for i, pooledCh := range channels {
+		if pooledCh == nil {
+			continue
+		}
+
+		ch, err := conn.Channel()
+		if err != nil {
+			return fmt.Errorf("failed to recreate channel %d: %w", i, err)
+		}
+
+		if err := ch.Qos(1, 0, false); err != nil {
+			_ = ch.Close()
+			return fmt.Errorf("failed to set QoS for channel %d: %w", i, err)
+		}
+
+		// Lock the slot so any in-flight publish finishes before we swap the channel
+		pooledCh.mutex.Lock()
+		old := pooledCh.channel
+		pooledCh.channel = ch
+		pooledCh.mutex.Unlock()
+
+		if old != nil {
+			_ = old.Close()
+		}
+	}
+
+	p.logger.Info("Channel pool recreated after reconnection")
+	return nil
+}
+
 // connect establishes connection to RabbitMQ and sets up exchanges and queues
 func (r *RabbitMQService) connect() error {
 	r.mutex.Lock()
@@ -85,7 +352,7 @@ func (r *RabbitMQService) connect() error {
 		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
 	}
 
-	// Create channel
+	// Create main channel (for topology setup and health checks)
 	ch, err := conn.Channel()
 	if err != nil {
 		_ = conn.Close()
@@ -113,6 +380,25 @@ func (r *RabbitMQService) connect() error {
 	if err := r.setupTopology(); err != nil {
 		return fmt.Errorf("failed to setup RabbitMQ topology: %w", err)
 	}
+
+	// Create or recreate channel pool for concurrent publishing
+	if r.channelPool == nil {
+		pool, err := NewChannelPool(conn, 5, r.config, r.logger)
+		if err != nil {
+			r.logger.WithError(err).Warn("Failed to create channel pool, falling back to single channel")
+			// Don't fail connection if pool creation fails - we can still use the main channel
+		} else {
+			r.channelPool = pool
+		}
+	} else {
+		// Recreate channels in existing pool after reconnection
+		if err := r.channelPool.RecreateChannels(conn); err != nil {
+			r.logger.WithError(err).Warn("Failed to recreate channel pool, falling back to single channel")
+		}
+	}
+
+	// Reset circuit breaker on successful connection
+	r.resetCircuitBreaker()
 
 	r.logger.Info("RabbitMQ connection established successfully")
 	return nil
@@ -228,17 +514,52 @@ func (r *RabbitMQService) declareDLQ(queueName string) error {
 
 // PublishMessage publishes a message to the specified queue
 func (r *RabbitMQService) PublishMessage(ctx context.Context, queueName string, message interface{}) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	if !r.isConnected {
-		return fmt.Errorf("RabbitMQ connection is not available")
+	// Check circuit breaker first (fast fail)
+	if err := r.checkCircuitBreaker(); err != nil {
+		return err
 	}
 
 	// Serialize message to JSON
 	body, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("failed to marshal message: %w", err)
+	}
+
+	publishing := amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent, // Make message persistent
+		Timestamp:    time.Now(),
+		MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+	}
+
+	// Try to use channel pool for better concurrency
+	if r.channelPool != nil {
+		err = r.channelPool.PublishWithPool(ctx, r.config.RabbitMQ.Exchange, queueName, publishing)
+		if err != nil {
+			r.recordFailure()
+			r.logger.WithError(err).WithFields(logrus.Fields{
+				"queue":   queueName,
+				"message": string(body),
+			}).Error("Failed to publish message via pool")
+			return fmt.Errorf("failed to publish message: %w", err)
+		}
+		r.recordSuccess()
+		r.logger.WithFields(logrus.Fields{
+			"queue":      queueName,
+			"message_id": publishing.MessageId,
+			"via":        "pool",
+		}).Debug("Message published successfully")
+		return nil
+	}
+
+	// Fallback to single channel if pool is not available
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if !r.isConnected {
+		r.recordFailure()
+		return fmt.Errorf("RabbitMQ connection is not available")
 	}
 
 	// Publish message
@@ -248,16 +569,11 @@ func (r *RabbitMQService) PublishMessage(ctx context.Context, queueName string, 
 		queueName,                  // routing key
 		false,                      // mandatory
 		false,                      // immediate
-		amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp.Persistent, // Make message persistent
-			Timestamp:    time.Now(),
-			MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
-		},
+		publishing,
 	)
 
 	if err != nil {
+		r.recordFailure()
 		r.logger.WithError(err).WithFields(logrus.Fields{
 			"queue":   queueName,
 			"message": string(body),
@@ -265,9 +581,10 @@ func (r *RabbitMQService) PublishMessage(ctx context.Context, queueName string, 
 		return fmt.Errorf("failed to publish message: %w", err)
 	}
 
+	r.recordSuccess()
 	r.logger.WithFields(logrus.Fields{
 		"queue":      queueName,
-		"message_id": fmt.Sprintf("%d", time.Now().UnixNano()),
+		"message_id": publishing.MessageId,
 	}).Debug("Message published successfully")
 
 	return nil
@@ -275,11 +592,9 @@ func (r *RabbitMQService) PublishMessage(ctx context.Context, queueName string, 
 
 // PublishMessageWithHeaders publishes a message with custom headers (for trace context)
 func (r *RabbitMQService) PublishMessageWithHeaders(ctx context.Context, queueName string, message interface{}, headers map[string]interface{}) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	if !r.isConnected {
-		return fmt.Errorf("RabbitMQ connection is not available")
+	// Check circuit breaker first (fast fail)
+	if err := r.checkCircuitBreaker(); err != nil {
+		return err
 	}
 
 	// Serialize message to JSON
@@ -294,24 +609,57 @@ func (r *RabbitMQService) PublishMessageWithHeaders(ctx context.Context, queueNa
 		amqpHeaders[k] = v
 	}
 
-	// Publish message with headers
+	publishing := amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent,
+		Timestamp:    time.Now(),
+		MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+		Headers:      amqpHeaders,
+	}
+
+	// Try to use channel pool for better concurrency
+	if r.channelPool != nil {
+		err = r.channelPool.PublishWithPool(ctx, r.config.RabbitMQ.Exchange, queueName, publishing)
+		if err != nil {
+			r.recordFailure()
+			r.logger.WithError(err).WithFields(logrus.Fields{
+				"queue":   queueName,
+				"message": string(body),
+				"headers": headers,
+			}).Error("Failed to publish message with headers via pool")
+			return fmt.Errorf("failed to publish message with headers: %w", err)
+		}
+		r.recordSuccess()
+		r.logger.WithFields(logrus.Fields{
+			"queue":      queueName,
+			"message_id": publishing.MessageId,
+			"headers":    headers,
+			"via":        "pool",
+		}).Debug("Message with headers published successfully")
+		return nil
+	}
+
+	// Fallback to single channel
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if !r.isConnected {
+		r.recordFailure()
+		return fmt.Errorf("RabbitMQ connection is not available")
+	}
+
 	err = r.channel.PublishWithContext(
 		ctx,
-		r.config.RabbitMQ.Exchange, // exchange
-		queueName,                  // routing key
-		false,                      // mandatory
-		false,                      // immediate
-		amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp.Persistent, // Make message persistent
-			Timestamp:    time.Now(),
-			MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
-			Headers:      amqpHeaders, // Include trace headers
-		},
+		r.config.RabbitMQ.Exchange,
+		queueName,
+		false,
+		false,
+		publishing,
 	)
 
 	if err != nil {
+		r.recordFailure()
 		r.logger.WithError(err).WithFields(logrus.Fields{
 			"queue":   queueName,
 			"message": string(body),
@@ -320,9 +668,10 @@ func (r *RabbitMQService) PublishMessageWithHeaders(ctx context.Context, queueNa
 		return fmt.Errorf("failed to publish message with headers: %w", err)
 	}
 
+	r.recordSuccess()
 	r.logger.WithFields(logrus.Fields{
 		"queue":      queueName,
-		"message_id": fmt.Sprintf("%d", time.Now().UnixNano()),
+		"message_id": publishing.MessageId,
 		"headers":    headers,
 	}).Debug("Message with headers published successfully")
 
@@ -331,11 +680,9 @@ func (r *RabbitMQService) PublishMessageWithHeaders(ctx context.Context, queueNa
 
 // PublishMessageWithDelay publishes a message with a delay using RabbitMQ delayed message plugin
 func (r *RabbitMQService) PublishMessageWithDelay(ctx context.Context, queueName string, message interface{}, delay time.Duration) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	if !r.isConnected {
-		return fmt.Errorf("RabbitMQ connection is not available")
+	// Check circuit breaker first (fast fail)
+	if err := r.checkCircuitBreaker(); err != nil {
+		return err
 	}
 
 	// Serialize message to JSON
@@ -349,37 +696,58 @@ func (r *RabbitMQService) PublishMessageWithDelay(ctx context.Context, queueName
 		"x-delay": int64(delay.Milliseconds()),
 	}
 
-	// Publish delayed message
+	publishing := amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent,
+		Timestamp:    time.Now(),
+		MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+		Headers:      headers,
+	}
+
+	// Try to use channel pool for better concurrency
+	if r.channelPool != nil {
+		err = r.channelPool.PublishWithPool(ctx, r.config.RabbitMQ.Exchange, queueName, publishing)
+		if err != nil {
+			r.recordFailure()
+			return fmt.Errorf("failed to publish delayed message: %w", err)
+		}
+		r.recordSuccess()
+		return nil
+	}
+
+	// Fallback to single channel
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if !r.isConnected {
+		r.recordFailure()
+		return fmt.Errorf("RabbitMQ connection is not available")
+	}
+
 	err = r.channel.PublishWithContext(
 		ctx,
-		r.config.RabbitMQ.Exchange, // exchange
-		queueName,                  // routing key
-		false,                      // mandatory
-		false,                      // immediate
-		amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp.Persistent,
-			Timestamp:    time.Now(),
-			MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
-			Headers:      headers,
-		},
+		r.config.RabbitMQ.Exchange,
+		queueName,
+		false,
+		false,
+		publishing,
 	)
 
 	if err != nil {
+		r.recordFailure()
 		return fmt.Errorf("failed to publish delayed message: %w", err)
 	}
 
+	r.recordSuccess()
 	return nil
 }
 
 // PublishPriorityMessage publishes a message with priority
 func (r *RabbitMQService) PublishPriorityMessage(ctx context.Context, queueName string, message interface{}, priority uint8) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	if !r.isConnected {
-		return fmt.Errorf("RabbitMQ connection is not available")
+	// Check circuit breaker first (fast fail)
+	if err := r.checkCircuitBreaker(); err != nil {
+		return err
 	}
 
 	// Serialize message to JSON
@@ -388,27 +756,50 @@ func (r *RabbitMQService) PublishPriorityMessage(ctx context.Context, queueName 
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// Publish message with priority
+	publishing := amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         body,
+		DeliveryMode: amqp.Persistent,
+		Priority:     priority,
+		Timestamp:    time.Now(),
+		MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+	}
+
+	// Try to use channel pool for better concurrency
+	if r.channelPool != nil {
+		err = r.channelPool.PublishWithPool(ctx, r.config.RabbitMQ.Exchange, queueName, publishing)
+		if err != nil {
+			r.recordFailure()
+			return fmt.Errorf("failed to publish priority message: %w", err)
+		}
+		r.recordSuccess()
+		return nil
+	}
+
+	// Fallback to single channel
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if !r.isConnected {
+		r.recordFailure()
+		return fmt.Errorf("RabbitMQ connection is not available")
+	}
+
 	err = r.channel.PublishWithContext(
 		ctx,
-		r.config.RabbitMQ.Exchange, // exchange
-		queueName,                  // routing key
-		false,                      // mandatory
-		false,                      // immediate
-		amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp.Persistent,
-			Priority:     priority,
-			Timestamp:    time.Now(),
-			MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
-		},
+		r.config.RabbitMQ.Exchange,
+		queueName,
+		false,
+		false,
+		publishing,
 	)
 
 	if err != nil {
+		r.recordFailure()
 		return fmt.Errorf("failed to publish priority message: %w", err)
 	}
 
+	r.recordSuccess()
 	return nil
 }
 
@@ -421,7 +812,9 @@ func (r *RabbitMQService) handleReconnect() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ connection lost, attempting to reconnect")
+			r.mutex.Lock()
 			r.isConnected = false
+			r.mutex.Unlock()
 			r.reconnect()
 
 		case err := <-r.notifyChanClose:
@@ -429,7 +822,9 @@ func (r *RabbitMQService) handleReconnect() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ channel lost, attempting to reconnect")
+			r.mutex.Lock()
 			r.isConnected = false
+			r.mutex.Unlock()
 			r.reconnect()
 
 		case <-r.notifyReconnect:
@@ -477,41 +872,30 @@ func (r *RabbitMQService) reconnect() {
 
 // HealthCheck implements the HealthChecker interface
 func (r *RabbitMQService) HealthCheck(ctx context.Context) error {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	// Check circuit breaker first - if open, fail fast
+	if r.IsCircuitOpen() {
+		return fmt.Errorf("circuit breaker is open, RabbitMQ health check skipped")
+	}
 
-	if !r.isConnected || r.connection == nil || r.connection.IsClosed() {
+	// Read connection state under a brief lock — no I/O while holding the mutex
+	r.mutex.Lock()
+	connected := r.isConnected
+	conn := r.connection
+	r.mutex.Unlock()
+
+	if !connected || conn == nil || conn.IsClosed() {
+		r.recordFailure()
 		return fmt.Errorf("RabbitMQ connection is not available")
 	}
 
-	// Try to declare a temporary queue to test connection
-	tempQueue := fmt.Sprintf("health_check_%d", time.Now().UnixNano())
-	_, err := r.channel.QueueDeclare(
-		tempQueue, // name
-		false,     // durable
-		true,      // delete when unused
-		true,      // exclusive
-		false,     // no-wait
-		nil,       // arguments
-	)
-
-	if err != nil {
-		return fmt.Errorf("RabbitMQ health check failed: %w", err)
-	}
-
-	// Clean up the temp queue
-	_, err = r.channel.QueueDelete(tempQueue, false, false, false)
-	if err != nil {
-		r.logger.WithError(err).Warn("Failed to clean up health check queue")
-	}
-
+	r.recordSuccess()
 	return nil
 }
 
 // GetQueueInfo returns information about a specific queue
 func (r *RabbitMQService) GetQueueInfo(queueName string) (amqp.Queue, error) {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mutex.Lock() // Use Lock - channel operations are not thread-safe
+	defer r.mutex.Unlock()
 
 	if !r.isConnected {
 		return amqp.Queue{}, fmt.Errorf("RabbitMQ connection is not available")
@@ -527,6 +911,12 @@ func (r *RabbitMQService) Close() error {
 
 	r.isShutdown = true
 	r.isConnected = false
+
+	// Close channel pool first
+	if r.channelPool != nil {
+		r.channelPool.Close()
+		r.channelPool = nil
+	}
 
 	if r.channel != nil {
 		if err := r.channel.Close(); err != nil {
@@ -547,8 +937,8 @@ func (r *RabbitMQService) Close() error {
 
 // IsConnected returns the current connection status
 func (r *RabbitMQService) IsConnected() bool {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 	return r.isConnected
 }
 
