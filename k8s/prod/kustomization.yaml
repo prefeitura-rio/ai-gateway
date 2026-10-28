@@ -5,8 +5,10 @@ helmCharts:
   # API Gateway
   - name: base-chart
     repo: oci://ghcr.io/prefeitura-rio/charts
-    version: 2.4.2
+    version: 2.4.20
     releaseName: ai-gateway
+    # O Valkey e o alvo do InfisicalStaticSecret usam o namespace do release.
+    namespace: ai-gateway
     skipTests: true
     valuesInline:
       image:
@@ -34,10 +36,7 @@ helmCharts:
           drop:
             - ALL
 
-      envFrom:
-        - secretRef:
-            name: ai-gateway-secrets
-
+      # O envFrom com o ai-gateway-secrets vem do infisicalStaticSecret.
       env:
         - name: SERVER_PORT
           value: "8000"
@@ -49,6 +48,15 @@ helmCharts:
           value: "info"
         - name: LOG_FORMAT
           value: "json"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-gateway-secrets
+              key: REDIS_PASSWORD
+        - name: REDIS_DSN
+          value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/0
+        - name: REDIS_BACKEND
+          value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/1
 
       resources:
         requests:
@@ -108,10 +116,47 @@ helmCharts:
       istio:
         enabled: false
 
+      # Service ai-gateway-valkey:6379, no lugar do release valkey do Terraform.
+      valkey:
+        enabled: true
+        architecture: standalone
+        replicaCount: 1
+        resources:
+          requests:
+            cpu: 250m
+            memory: 1Gi
+          limits:
+            cpu: 250m
+            memory: 1Gi
+        persistence:
+          enabled: true
+          size: 1Gi
+          accessModes:
+            - ReadWriteOnce
+        auth:
+          enabled: true
+          existingSecret: ai-gateway-secrets
+          existingSecretPasswordKey: REDIS_PASSWORD
+        metrics:
+          enabled: true
+
+      infisical:
+        instance: old
+
+      infisicalStaticSecret:
+        enabled: true
+        secretName: ai-gateway-secrets
+        projectSlug: ai-gateway-x5-yk
+        envSlug: prod
+
+      # A imagem segue a tag stable; o deploy é do Argo CD, não do Flux.
+      flux:
+        enabled: false
+
   # Message Workers
   - name: base-chart
     repo: oci://ghcr.io/prefeitura-rio/charts
-    version: 2.4.2
+    version: 2.4.20
     releaseName: ai-gateway-worker
     skipTests: true
     valuesInline:
@@ -146,6 +191,15 @@ helmCharts:
           value: "json"
         - name: TRANSCRIBE_TEMP_DIR
           value: "/tmp/audio"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-gateway-secrets
+              key: REDIS_PASSWORD
+        - name: REDIS_DSN
+          value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/0
+        - name: REDIS_BACKEND
+          value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/1
 
       volumes:
         - name: temp-audio
@@ -171,6 +225,9 @@ helmCharts:
         minAvailable: 1
 
       istio:
+        enabled: false
+
+      flux:
         enabled: false
 
       autoscaling:
@@ -202,6 +259,32 @@ helmCharts:
 
 # O base-chart não expõe estes campos: os patches mantêm o que já roda no cluster.
 patches:
+  # Desde a 2.4.9 o base-chart marca os recursos como hooks do Helm (feito para
+  # o Flux). No Argo CD um hook vira PreSync e é apagado e recriado a cada sync;
+  # sem as anotações, os recursos são gerenciados como antes. As sync-waves
+  # são as que a 2.4.2 punha (peso do hook + 1); o Valkey e o
+  # InfisicalStaticSecret ficam na onda 0, antes dos Deployments.
+  - target:
+      annotationSelector: helm.sh/hook-weight=0
+    patch: |-
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-wave
+        value: "1"
+  - target:
+      annotationSelector: helm.sh/hook-weight=1
+    patch: |-
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-wave
+        value: "2"
+  - target:
+      annotationSelector: helm.sh/hook
+    patch: |-
+      - op: remove
+        path: /metadata/annotations/helm.sh~1hook
+      - op: remove
+        path: /metadata/annotations/helm.sh~1hook-weight
+      - op: remove
+        path: /metadata/annotations/helm.sh~1hook-delete-policy
   # A imagem não tem entrypoint (o binário vem do command). O seletor continua
   # `app: <nome>` porque o spec.selector de um Deployment é imutável. O
   # ghcr-credentials não existe no namespace (a imagem é pública).
