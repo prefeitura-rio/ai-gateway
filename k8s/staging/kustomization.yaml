@@ -1,5 +1,294 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-resources:
-  - resources.yaml
+helmCharts:
+  # API Gateway
+  - name: base-chart
+    repo: oci://ghcr.io/prefeitura-rio/charts
+    version: 2.4.2
+    releaseName: ai-gateway
+    skipTests: true
+    valuesInline:
+      image:
+        repository: ghcr.io/prefeitura-rio/ai-gateway
+        tag: stable
+
+      podLabels:
+        app: ai-gateway
+
+      podAnnotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+
+      podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+      envFrom:
+        - secretRef:
+            name: ai-gateway-secrets
+
+      env:
+        - name: SERVER_PORT
+          value: "8000"
+        - name: METRICS_PORT
+          value: "8080"
+        - name: GIN_MODE
+          value: "release"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "json"
+
+      resources:
+        requests:
+          ephemeral-storage: 500Mi
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          ephemeral-storage: 2Gi
+          cpu: 2000m
+          memory: 2Gi
+
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+
+      livenessProbe:
+        httpGet:
+          path: /live
+          port: 8000
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 3
+
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 10
+        periodSeconds: 5
+        timeoutSeconds: 5
+        failureThreshold: 12
+
+      service:
+        type: ClusterIP
+        port: 80
+        containerPort: 8000
+        ports:
+          - name: metrics
+            port: 8080
+            targetPort: 8080
+            protocol: TCP
+
+      podDisruptionBudget:
+        enabled: true
+        maxUnavailable: 0
+        minAvailable: 1
+
+      autoscaling:
+        enabled: false
+
+      istio:
+        enabled: false
+
+  # Message Workers
+  - name: base-chart
+    repo: oci://ghcr.io/prefeitura-rio/charts
+    version: 2.4.2
+    releaseName: ai-gateway-worker
+    skipTests: true
+    valuesInline:
+      image:
+        repository: ghcr.io/prefeitura-rio/ai-gateway
+        tag: stable
+
+      podLabels:
+        app: ai-gateway-worker
+
+      podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+      envFrom:
+        - secretRef:
+            name: ai-gateway-secrets
+
+      env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "json"
+        - name: TRANSCRIBE_TEMP_DIR
+          value: "/tmp/audio"
+
+      volumes:
+        - name: temp-audio
+          emptyDir: {}
+
+      volumeMounts:
+        - name: temp-audio
+          mountPath: /tmp/audio
+
+      resources:
+        requests:
+          ephemeral-storage: 1Gi
+          cpu: 250m
+          memory: 128Mi
+        limits:
+          ephemeral-storage: 4Gi
+          cpu: 1000m
+          memory: 512Mi
+
+      podDisruptionBudget:
+        enabled: true
+        maxUnavailable: 0
+        minAvailable: 1
+
+      istio:
+        enabled: false
+
+      autoscaling:
+        enabled: true
+        minReplicas: 1
+        maxReplicas: 10
+        keda:
+          enabled: true
+          triggerAuthentication:
+            name: keda-trigger-auth-rabbitmq-conn
+            secretTargetRef:
+              - parameter: host
+                name: rabbitmq-external-secret
+                key: host
+              - parameter: username
+                name: rabbitmq-external-secret
+                key: username
+              - parameter: password
+                name: rabbitmq-external-secret
+                key: password
+          triggers:
+            - type: rabbitmq
+              metadata:
+                protocol: http
+                host: "http://rabbitmq.ai-gateway-staging.svc.cluster.local:15672"
+                queueName: user_messages
+                mode: QueueLength
+                value: "100"
+
+# O base-chart não expõe estes campos: os patches mantêm o que já roda no cluster.
+patches:
+  # A imagem não tem entrypoint (o binário vem do command). O seletor continua
+  # `app: <nome>` porque o spec.selector de um Deployment é imutável. O
+  # ghcr-credentials não existe no namespace (a imagem é pública).
+  - target:
+      kind: Deployment
+      name: ai-gateway
+    patch: |-
+      - op: replace
+        path: /spec/selector/matchLabels
+        value:
+          app: ai-gateway
+      - op: replace
+        path: /spec/template/spec/containers/0/name
+        value: ai-gateway
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["/app/gateway"]
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: remove
+        path: /spec/template/spec/imagePullSecrets
+  - target:
+      kind: Deployment
+      name: ai-gateway-worker
+    patch: |-
+      - op: replace
+        path: /spec/selector/matchLabels
+        value:
+          app: ai-gateway-worker
+      - op: replace
+        path: /spec/template/spec/containers/0/name
+        value: ai-gateway-worker
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["/app/worker"]
+      - op: remove
+        path: /spec/template/spec/containers/0/ports
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: remove
+        path: /spec/template/spec/imagePullSecrets
+  - target:
+      kind: Service
+      name: ai-gateway
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: ai-gateway
+      - op: add
+        path: /metadata/annotations/prometheus.io~1scrape
+        value: "true"
+      - op: add
+        path: /metadata/annotations/prometheus.io~1port
+        value: "8080"
+      - op: add
+        path: /metadata/annotations/prometheus.io~1path
+        value: "/metrics"
+  # O worker não serve HTTP: o chart sempre cria um Service e a porta http
+  # do container (removida no patch acima), que não existiam.
+  - target:
+      kind: Service
+      name: ai-gateway-worker
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ai-gateway-worker
+  # Mesmo nome de antes: o webhook do KEDA recusa um segundo ScaledObject
+  # para o mesmo Deployment enquanto o antigo existir.
+  - target:
+      kind: ScaledObject
+      name: ai-gateway-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: ai-gateway-worker-scaledobject
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-options
+        value: SkipDryRunOnMissingResource=true
+  - target:
+      kind: TriggerAuthentication
+      name: keda-trigger-auth-rabbitmq-conn
+    patch: |-
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-options
+        value: SkipDryRunOnMissingResource=true
