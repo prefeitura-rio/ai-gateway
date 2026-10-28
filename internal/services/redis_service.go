@@ -3,7 +3,9 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 	"time"
 
@@ -126,7 +128,7 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 	// Parse Redis DSN for main connection
 	opts, err := redis.ParseURL(cfg.Redis.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Redis DSN: %w", err)
+		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactDSNError(err))
 	}
 
 	// Configure connection pool
@@ -149,8 +151,10 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
+	// Never log the DSN itself: it carries the Redis credentials.
 	logger.WithFields(logrus.Fields{
-		"dsn":       cfg.Redis.DSN,
+		"addr":      opts.Addr,
+		"db":        opts.DB,
 		"pool_size": cfg.Redis.PoolSize,
 		"min_idle":  cfg.Redis.MinIdleConnections,
 		"max_idle":  cfg.Redis.MaxIdleConnections,
@@ -164,6 +168,16 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 			LastResetTime: time.Now(),
 		},
 	}, nil
+}
+
+// redactDSNError drops the URL that net/url embeds in its parse errors, since
+// the DSN may carry the Redis password. The underlying reason is kept.
+func redactDSNError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
 
 // Get retrieves a value by key
