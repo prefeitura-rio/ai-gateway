@@ -3,8 +3,10 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -39,6 +41,9 @@ type ChannelPool struct {
 	config     *config.Config
 }
 
+// errRabbitMQShutdown is returned by connect once Close has been called.
+var errRabbitMQShutdown = errors.New("RabbitMQ service is shut down")
+
 // RabbitMQService handles RabbitMQ operations with connection management
 type RabbitMQService struct {
 	config      *config.Config
@@ -51,11 +56,16 @@ type RabbitMQService struct {
 	// Channel pool for concurrent publishing
 	channelPool *ChannelPool
 
-	// Connection monitoring
+	// Connection monitoring. connect() replaces the close notification
+	// channels on every (re)connection; notifyMu guards them so that
+	// handleReconnect never reads them while they are being replaced. It is
+	// separate from mutex because Close() holds mutex while it talks to the
+	// broker, and handleReconnect must keep draining notifications meanwhile.
+	notifyMu        sync.Mutex
 	notifyConnClose chan *amqp.Error
 	notifyChanClose chan *amqp.Error
 	notifyReconnect chan bool
-	isShutdown      bool
+	isShutdown      atomic.Bool
 
 	// Circuit breaker state
 	circuitState     CircuitState
@@ -346,6 +356,13 @@ func (r *RabbitMQService) connect() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	// Close() sets isShutdown under mutex, so checking it here, with mutex
+	// held, keeps a reconnection that was already waiting from dialing the
+	// broker again after Close.
+	if r.isShutdown.Load() {
+		return errRabbitMQShutdown
+	}
+
 	// Connect to RabbitMQ
 	conn, err := amqp.Dial(r.config.RabbitMQ.URL)
 	if err != nil {
@@ -366,6 +383,7 @@ func (r *RabbitMQService) connect() error {
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
+	r.notifyMu.Lock()
 	r.connection = conn
 	r.channel = ch
 	r.isConnected = true
@@ -375,6 +393,7 @@ func (r *RabbitMQService) connect() error {
 	r.notifyChanClose = make(chan *amqp.Error)
 	r.connection.NotifyClose(r.notifyConnClose)
 	r.channel.NotifyClose(r.notifyChanClose)
+	r.notifyMu.Unlock()
 
 	// Setup exchanges and queues
 	if err := r.setupTopology(); err != nil {
@@ -816,9 +835,16 @@ func (r *RabbitMQService) PublishPriorityMessage(ctx context.Context, queueName 
 // handleReconnect monitors connection and handles automatic reconnection
 func (r *RabbitMQService) handleReconnect() {
 	for {
+		// Take the notification channels of the current connection at the
+		// start of every round: a reconnection replaces them.
+		r.notifyMu.Lock()
+		notifyConnClose := r.notifyConnClose
+		notifyChanClose := r.notifyChanClose
+		r.notifyMu.Unlock()
+
 		select {
-		case err := <-r.notifyConnClose:
-			if r.isShutdown {
+		case err := <-notifyConnClose:
+			if r.isShutdown.Load() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ connection lost, attempting to reconnect")
@@ -827,8 +853,8 @@ func (r *RabbitMQService) handleReconnect() {
 			r.mutex.Unlock()
 			r.reconnect()
 
-		case err := <-r.notifyChanClose:
-			if r.isShutdown {
+		case err := <-notifyChanClose:
+			if r.isShutdown.Load() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ channel lost, attempting to reconnect")
@@ -838,7 +864,7 @@ func (r *RabbitMQService) handleReconnect() {
 			r.reconnect()
 
 		case <-r.notifyReconnect:
-			if r.isShutdown {
+			if r.isShutdown.Load() {
 				return
 			}
 			r.logger.Info("Manual reconnection requested")
@@ -853,7 +879,7 @@ func (r *RabbitMQService) reconnect() {
 	maxRetries := r.config.RabbitMQ.MaxRetries
 
 	for retryCount < maxRetries {
-		if r.isShutdown {
+		if r.isShutdown.Load() {
 			return
 		}
 
@@ -868,6 +894,9 @@ func (r *RabbitMQService) reconnect() {
 		time.Sleep(delay)
 
 		if err := r.connect(); err != nil {
+			if errors.Is(err, errRabbitMQShutdown) {
+				return
+			}
 			r.logger.WithError(err).WithField("retry_count", retryCount+1).Error("Failed to reconnect to RabbitMQ")
 			retryCount++
 			continue
@@ -919,7 +948,7 @@ func (r *RabbitMQService) Close() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	r.isShutdown = true
+	r.isShutdown.Store(true)
 	r.isConnected = false
 
 	// Close channel pool first
