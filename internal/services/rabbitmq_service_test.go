@@ -269,3 +269,46 @@ func TestNewRabbitMQService_ParseErrorDoesNotLeakPassword(t *testing.T) {
 		})
 	}
 }
+
+func TestNewRabbitMQService_ConnectErrorDoesNotLeakPasswordAsPort(t *testing.T) {
+	// The password starts with digits (a valid port) followed by an unescaped
+	// '/', '?' or '#': net/url ends the authority there and reads the username
+	// as the host and the digits as the port, so the dial error quotes them
+	// unless the URL is refused before dialing.
+	port := closedLocalPort(t)
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"slash in password", "amqp://localhost:" + port + "/OPS143@rabbitmq.invalid:5672/"},
+		{"question mark in password", "amqp://localhost:" + port + "?OPS143@rabbitmq.invalid:5672/"},
+		{"hash in password", "amqp://localhost:" + port + "#OPS143@rabbitmq.invalid:5672/"},
+		{"at sign and slash in password", "amqp://gateway:Sint3tica@localhost:" + port + "/OPS143@rabbitmq.invalid:5672/"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, buf := newBufferLogger()
+
+			svc, err := NewRabbitMQService(newTestRabbitMQConfig(tc.url), logger)
+			require.Error(t, err)
+			assert.Nil(t, svc)
+			assert.Contains(t, err.Error(), "failed to connect to RabbitMQ")
+			assert.ErrorIs(t, err, errInvalidURL)
+			assert.NotContains(t, err.Error(), port, "connect error must not carry the digits of the password read as the port")
+			assert.NotContains(t, err.Error(), "OPS143", "connect error must not carry any piece of the RabbitMQ password")
+			assert.NotContains(t, buf.String(), "OPS143")
+		})
+	}
+}
+
+func TestNewRabbitMQService_EscapedPasswordStillConnects(t *testing.T) {
+	// The same password percent-encoded is a valid URL and must keep working.
+	addr := startFakeRabbitMQ(t)
+	url := fmt.Sprintf("amqp://gateway:12345%%2FOPS143%%3F%%23@%s/ai-gateway", addr)
+	logger, _ := newBufferLogger()
+
+	svc, err := NewRabbitMQService(newTestRabbitMQConfig(url), logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = svc.Close() })
+}
