@@ -128,7 +128,7 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 	// Parse Redis DSN for main connection
 	opts, err := redis.ParseURL(cfg.Redis.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactDSNError(err))
+		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactURLError(err))
 	}
 
 	// Configure connection pool
@@ -170,12 +170,18 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 	}, nil
 }
 
-// redactDSNError drops the URL that net/url embeds in its parse errors, since
-// the DSN may carry the Redis password. The underlying reason is kept.
-func redactDSNError(err error) error {
+// errInvalidURL replaces a net/url parse error of a connection URL.
+var errInvalidURL = errors.New("invalid URL (details omitted: the URL may carry credentials)")
+
+// redactURLError replaces a net/url parse error with errInvalidURL, since a
+// connection URL (REDIS_DSN, RABBITMQ_URL) may carry a password. Neither the
+// URL nor the reason is kept: an unescaped '/', '?' or '#' in the password
+// makes net/url read part of it as the port, and an invalid escape is quoted,
+// so the reason itself can carry a piece of the password.
+func redactURLError(err error) error {
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		return urlErr.Err
+		return errInvalidURL
 	}
 	return err
 }
