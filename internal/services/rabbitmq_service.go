@@ -3,7 +3,9 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -115,8 +117,42 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 	// Setup auto-reconnection
 	go service.handleReconnect()
 
-	logger.WithField("url", cfg.RabbitMQ.URL).Info("RabbitMQ service initialized successfully")
+	// Never log RABBITMQ_URL itself: it carries the RabbitMQ credentials.
+	logger.WithFields(rabbitMQLogFields(cfg.RabbitMQ.URL)).Info("RabbitMQ service initialized successfully")
 	return service, nil
+}
+
+// rabbitMQLogFields describes the broker by host, port and vhost only, leaving
+// out the username and password that RABBITMQ_URL carries.
+func rabbitMQLogFields(rawURL string) logrus.Fields {
+	uri, err := amqp.ParseURI(rawURL)
+	if err != nil {
+		return logrus.Fields{}
+	}
+	return logrus.Fields{
+		"host":  uri.Host,
+		"port":  uri.Port,
+		"vhost": uri.Vhost,
+	}
+}
+
+// validateRabbitMQURL refuses, without quoting it, a URL that amqp.Dial would
+// misread. An unescaped '/', '?' or '#' in the password makes its leading
+// characters look like the port: net/url quotes them, amqp.ParseURI quotes a
+// port out of range, and the dialer quotes a port above 65535.
+func validateRabbitMQURL(rawURL string) error {
+	uri, err := amqp.ParseURI(rawURL)
+	if err != nil {
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) {
+			return errInvalidURL
+		}
+		return redactURLError(err)
+	}
+	if uri.Port < 1 || uri.Port > 65535 {
+		return errInvalidURL
+	}
+	return nil
 }
 
 // checkCircuitBreaker checks if the circuit breaker allows the operation
@@ -347,9 +383,12 @@ func (r *RabbitMQService) connect() error {
 	defer r.mutex.Unlock()
 
 	// Connect to RabbitMQ
+	if err := validateRabbitMQURL(r.config.RabbitMQ.URL); err != nil {
+		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+	}
 	conn, err := amqp.Dial(r.config.RabbitMQ.URL)
 	if err != nil {
-		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+		return fmt.Errorf("failed to connect to RabbitMQ: %w", redactURLError(err))
 	}
 
 	// Create main channel (for topology setup and health checks)

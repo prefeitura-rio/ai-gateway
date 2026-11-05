@@ -172,3 +172,18 @@ func TestNewRedisService_ParseErrorDoesNotLeakPassword(t *testing.T) {
 	assert.NotContains(t, err.Error(), testRedisPassword, "parse error must not carry the Redis password")
 	assert.NotContains(t, buf.String(), testRedisPassword)
 }
+
+func TestNewRedisService_ParseErrorDoesNotLeakPasswordPiece(t *testing.T) {
+	// An unescaped '/' in the password makes net/url read its first piece as
+	// the port and quote it in the reason of the error.
+	dsn := "redis://default:Sint3tica/OPS43@redis.invalid:6379/0"
+	logger, buf := newBufferLogger()
+
+	svc, err := NewRedisService(newTestRedisConfig(dsn), logger)
+	require.Error(t, err)
+	assert.Nil(t, svc)
+	assert.Contains(t, err.Error(), "failed to parse Redis DSN")
+	assert.ErrorIs(t, err, errInvalidURL)
+	assert.NotContains(t, err.Error(), "Sint3tica", "parse error must not carry any piece of the Redis password")
+	assert.NotContains(t, buf.String(), "Sint3tica")
+}
