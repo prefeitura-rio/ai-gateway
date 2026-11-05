@@ -237,15 +237,33 @@ func TestNewRabbitMQService_StartupLogDoesNotLeakPassword(t *testing.T) {
 }
 
 func TestNewRabbitMQService_ParseErrorDoesNotLeakPassword(t *testing.T) {
-	// The port is not numeric, so net/url refuses the URL; its error embeds
-	// the whole URL unless it is redacted.
-	url := fmt.Sprintf("amqp://gateway:%s@rabbitmq.invalid:porta/", testRabbitMQPassword)
-	logger, buf := newBufferLogger()
+	// Each URL is refused by net/url, whose error embeds the whole URL and,
+	// in its reason, the piece of the password it misread (as the port, or as
+	// an invalid escape) unless the error is redacted.
+	cases := []struct {
+		name string
+		url  string
+		leak string // the piece of the password net/url would quote
+	}{
+		{"non-numeric port", fmt.Sprintf("amqp://gateway:%s@rabbitmq.invalid:porta/", testRabbitMQPassword), testRabbitMQPassword},
+		{"slash in password", "amqp://gateway:Sint3tica/OPS138@rabbitmq.invalid:5672/", "Sint3tica"},
+		{"hash in password", "amqp://gateway:Sint3tica#OPS138@rabbitmq.invalid:5672/", "Sint3tica"},
+		{"question mark in password", "amqp://gateway:Sint3tica?OPS138@rabbitmq.invalid:5672/", "Sint3tica"},
+		{"invalid escape in password", "amqp://gateway:Sint3tica%zzOPS138@rabbitmq.invalid:5672/", "%zz"},
+	}
 
-	svc, err := NewRabbitMQService(newTestRabbitMQConfig(url), logger)
-	require.Error(t, err)
-	assert.Nil(t, svc)
-	assert.Contains(t, err.Error(), "failed to connect to RabbitMQ")
-	assert.NotContains(t, err.Error(), testRabbitMQPassword, "parse error must not carry the RabbitMQ password")
-	assert.NotContains(t, buf.String(), testRabbitMQPassword)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, buf := newBufferLogger()
+
+			svc, err := NewRabbitMQService(newTestRabbitMQConfig(tc.url), logger)
+			require.Error(t, err)
+			assert.Nil(t, svc)
+			assert.Contains(t, err.Error(), "failed to connect to RabbitMQ")
+			assert.ErrorIs(t, err, errInvalidURL)
+			assert.NotContains(t, err.Error(), tc.leak, "parse error must not carry any piece of the RabbitMQ password")
+			assert.NotContains(t, err.Error(), "OPS138", "parse error must not carry any piece of the RabbitMQ password")
+			assert.NotContains(t, buf.String(), tc.leak)
+		})
+	}
 }
