@@ -57,6 +57,15 @@ helmCharts:
           value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/0
         - name: REDIS_BACKEND
           value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/1
+        # Broker do chart ai-gateway-rabbitmq (Terraform, OPS-34); o env tem
+        # precedência sobre o RABBITMQ_URL do ai-gateway-secrets.
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-gateway-rabbitmq
+              key: password
+        - name: RABBITMQ_URL
+          value: amqp://ai-gateway:$(RABBITMQ_PASSWORD)@ai-gateway-rabbitmq:5672/
 
       resources:
         requests:
@@ -200,6 +209,13 @@ helmCharts:
           value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/0
         - name: REDIS_BACKEND
           value: redis://default:$(REDIS_PASSWORD)@ai-gateway-valkey:6379/1
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-gateway-rabbitmq
+              key: password
+        - name: RABBITMQ_URL
+          value: amqp://ai-gateway:$(RABBITMQ_PASSWORD)@ai-gateway-rabbitmq:5672/
 
       volumes:
         - name: temp-audio
@@ -239,20 +255,17 @@ helmCharts:
           triggerAuthentication:
             name: keda-trigger-auth-rabbitmq-conn
             secretTargetRef:
-              - parameter: host
-                name: rabbitmq-external-secret
-                key: host
               - parameter: username
                 name: rabbitmq-external-secret
                 key: username
               - parameter: password
-                name: rabbitmq-external-secret
+                name: ai-gateway-rabbitmq
                 key: password
           triggers:
             - type: rabbitmq
               metadata:
                 protocol: http
-                host: "http://rabbitmq.ai-gateway-staging.svc.cluster.local:15672"
+                host: "http://ai-gateway-rabbitmq.ai-gateway-staging.svc.cluster.local:15672"
                 queueName: user_messages
                 mode: QueueLength
                 value: "100"
