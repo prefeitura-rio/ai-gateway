@@ -115,8 +115,23 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 	// Setup auto-reconnection
 	go service.handleReconnect()
 
-	logger.WithField("url", cfg.RabbitMQ.URL).Info("RabbitMQ service initialized successfully")
+	// Never log RABBITMQ_URL itself: it carries the RabbitMQ credentials.
+	logger.WithFields(rabbitMQLogFields(cfg.RabbitMQ.URL)).Info("RabbitMQ service initialized successfully")
 	return service, nil
+}
+
+// rabbitMQLogFields describes the broker by host, port and vhost only, leaving
+// out the username and password that RABBITMQ_URL carries.
+func rabbitMQLogFields(rawURL string) logrus.Fields {
+	uri, err := amqp.ParseURI(rawURL)
+	if err != nil {
+		return logrus.Fields{}
+	}
+	return logrus.Fields{
+		"host":  uri.Host,
+		"port":  uri.Port,
+		"vhost": uri.Vhost,
+	}
 }
 
 // checkCircuitBreaker checks if the circuit breaker allows the operation
@@ -349,7 +364,7 @@ func (r *RabbitMQService) connect() error {
 	// Connect to RabbitMQ
 	conn, err := amqp.Dial(r.config.RabbitMQ.URL)
 	if err != nil {
-		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+		return fmt.Errorf("failed to connect to RabbitMQ: %w", redactURLError(err))
 	}
 
 	// Create main channel (for topology setup and health checks)

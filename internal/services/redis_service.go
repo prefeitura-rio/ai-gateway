@@ -128,7 +128,7 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 	// Parse Redis DSN for main connection
 	opts, err := redis.ParseURL(cfg.Redis.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactDSNError(err))
+		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactURLError(err))
 	}
 
 	// Configure connection pool
@@ -170,9 +170,10 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 	}, nil
 }
 
-// redactDSNError drops the URL that net/url embeds in its parse errors, since
-// the DSN may carry the Redis password. The underlying reason is kept.
-func redactDSNError(err error) error {
+// redactURLError drops the URL that net/url embeds in its parse errors, since
+// a connection URL (REDIS_DSN, RABBITMQ_URL) may carry a password. The
+// underlying reason is kept.
+func redactURLError(err error) error {
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
 		return urlErr.Err
