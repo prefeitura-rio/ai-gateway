@@ -139,8 +139,12 @@ func rabbitMQLogFields(rawURL string) logrus.Fields {
 // validateRabbitMQURL refuses, without quoting it, a URL that amqp.Dial would
 // misread. An unescaped '/', '?' or '#' in the password makes its leading
 // characters look like the port: net/url quotes them, amqp.ParseURI quotes a
-// port out of range, and the dialer quotes a port above 65535.
+// port out of range, and the dialer quotes a port above 65535 and, in a dial
+// error, any port of a host that resolves.
 func validateRabbitMQURL(rawURL string) error {
+	if authorityCutShort(rawURL) {
+		return errInvalidURL
+	}
 	uri, err := amqp.ParseURI(rawURL)
 	if err != nil {
 		var numErr *strconv.NumError
