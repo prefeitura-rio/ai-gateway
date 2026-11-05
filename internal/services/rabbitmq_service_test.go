@@ -250,6 +250,8 @@ func TestNewRabbitMQService_ParseErrorDoesNotLeakPassword(t *testing.T) {
 		{"hash in password", "amqp://gateway:Sint3tica#OPS138@rabbitmq.invalid:5672/", "Sint3tica"},
 		{"question mark in password", "amqp://gateway:Sint3tica?OPS138@rabbitmq.invalid:5672/", "Sint3tica"},
 		{"invalid escape in password", "amqp://gateway:Sint3tica%zzOPS138@rabbitmq.invalid:5672/", "%zz"},
+		{"digits out of range before slash", "amqp://gateway:12345678901/OPS138@rabbitmq.invalid:5672/", "12345678901"},
+		{"digits above 65535 before slash", "amqp://gateway:987654/OPS138@rabbitmq.invalid:5672/", "987654"},
 	}
 
 	for _, tc := range cases {
