@@ -370,9 +370,12 @@ func (r *RabbitMQService) connect() error {
 	r.channel = ch
 	r.isConnected = true
 
-	// Setup connection monitoring
-	r.notifyConnClose = make(chan *amqp.Error)
-	r.notifyChanClose = make(chan *amqp.Error)
+	// Setup connection monitoring. The channels are buffered (as amqp091-go
+	// recommends for NotifyClose): the library sends the close error while
+	// holding its shutdown lock, so with no reader (Close already running, or
+	// handleReconnect busy reconnecting) an unbuffered send would block forever.
+	r.notifyConnClose = make(chan *amqp.Error, 1)
+	r.notifyChanClose = make(chan *amqp.Error, 1)
 	r.connection.NotifyClose(r.notifyConnClose)
 	r.channel.NotifyClose(r.notifyChanClose)
 
