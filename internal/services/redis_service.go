@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -126,6 +128,9 @@ type CacheInterface interface {
 // NewRedisService creates a new Redis service with connection pooling
 func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, error) {
 	// Parse Redis DSN for main connection
+	if err := validateRedisDSN(cfg.Redis.DSN); err != nil {
+		return nil, fmt.Errorf("failed to parse Redis DSN: %w", err)
+	}
 	opts, err := redis.ParseURL(cfg.Redis.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactURLError(err))
@@ -171,7 +176,45 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 }
 
 // errInvalidURL replaces a net/url parse error of a connection URL.
-var errInvalidURL = errors.New("invalid URL (details omitted: the URL may carry credentials)")
+var errInvalidURL = errors.New("invalid URL (details omitted: the URL may carry credentials; percent-encode '/', '?', '#' and '@' in the username and password)")
+
+// validateRedisDSN refuses, without quoting it, a DSN that redis.ParseURL
+// would misread. redis.ParseURL does not check the port, so an unescaped '/',
+// '?' or '#' in the password makes the dial (or the parse of the path and
+// query) quote the pieces of the password read as host, port, path or query.
+func validateRedisDSN(dsn string) error {
+	if authorityCutShort(dsn) {
+		return errInvalidURL
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return redactURLError(err)
+	}
+	if p := u.Port(); p != "" {
+		port, err := strconv.Atoi(p)
+		if err != nil || port < 1 || port > 65535 {
+			return errInvalidURL
+		}
+	}
+	return nil
+}
+
+// authorityCutShort reports whether an '@' follows the end of the authority
+// of a connection URL. net/url ends the authority at the first '/', '?' or
+// '#', so an '@' after it means the userinfo holds one of them unescaped: the
+// host and the port net/url reads are then pieces of the username and the
+// password, and a dial error would quote them.
+func authorityCutShort(rawURL string) bool {
+	_, rest, ok := strings.Cut(rawURL, "://")
+	if !ok {
+		return false
+	}
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		return false
+	}
+	return strings.Contains(rest[end:], "@")
+}
 
 // redactURLError replaces a net/url parse error with errInvalidURL, since a
 // connection URL (REDIS_DSN, RABBITMQ_URL) may carry a password. Neither the

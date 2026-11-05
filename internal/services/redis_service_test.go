@@ -187,3 +187,74 @@ func TestNewRedisService_ParseErrorDoesNotLeakPasswordPiece(t *testing.T) {
 	assert.NotContains(t, err.Error(), "Sint3tica", "parse error must not carry any piece of the Redis password")
 	assert.NotContains(t, buf.String(), "Sint3tica")
 }
+
+// closedLocalPort returns a TCP port on 127.0.0.1 that nothing listens on, so
+// a dial to it fails at once with an error that quotes the address.
+func closedLocalPort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	require.NoError(t, ln.Close())
+	return port
+}
+
+func TestNewRedisService_ConnectErrorDoesNotLeakPasswordAsPort(t *testing.T) {
+	// The password starts with digits followed by an unescaped '/', '?' or
+	// '#': net/url ends the authority there, reads the username as the host
+	// and the digits as the port, and the error of the dial (or of the parse
+	// of what follows) quotes them unless the DSN is refused before.
+	port := closedLocalPort(t)
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{"slash in password", "redis://localhost:" + port + "/OPS143@redis.invalid:6379/0"},
+		{"question mark in password", "redis://localhost:" + port + "?OPS143@redis.invalid:6379/0"},
+		{"hash in password", "redis://localhost:" + port + "#OPS143@redis.invalid:6379/0"},
+		{"at sign and slash in password", "redis://default:Sint3tica@localhost:" + port + "/OPS143@redis.invalid:6379/0"},
+		{"digits above 65535 before slash", "redis://localhost:987654/OPS143@redis.invalid:6379/0"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, buf := newBufferLogger()
+
+			svc, err := NewRedisService(newTestRedisConfig(tc.dsn), logger)
+			require.Error(t, err)
+			assert.Nil(t, svc)
+			assert.Contains(t, err.Error(), "failed to parse Redis DSN")
+			assert.ErrorIs(t, err, errInvalidURL)
+			assert.NotContains(t, err.Error(), port, "connect error must not carry the digits of the password read as the port")
+			assert.NotContains(t, err.Error(), "987654", "connect error must not carry the digits of the password read as the port")
+			assert.NotContains(t, err.Error(), "OPS143", "connect error must not carry any piece of the Redis password")
+			assert.NotContains(t, buf.String(), "OPS143")
+		})
+	}
+}
+
+func TestNewRedisService_RefusesPortOutOfRange(t *testing.T) {
+	for _, dsn := range []string{
+		"redis://redis.invalid:987654/0",
+		"redis://redis.invalid:0/0",
+	} {
+		t.Run(dsn, func(t *testing.T) {
+			svc, err := NewRedisService(newTestRedisConfig(dsn), logrus.New())
+			require.Error(t, err)
+			assert.Nil(t, svc)
+			assert.ErrorIs(t, err, errInvalidURL)
+			assert.NotContains(t, err.Error(), "987654")
+		})
+	}
+}
+
+func TestNewRedisService_EscapedPasswordStillConnects(t *testing.T) {
+	// The same password percent-encoded is a valid DSN and must keep working.
+	addr := startFakeRedis(t)
+	dsn := fmt.Sprintf("redis://default:12345%%2FOPS143%%3F%%23@%s/3", addr)
+
+	svc, err := NewRedisService(newTestRedisConfig(dsn), logrus.New())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = svc.Close() })
+}
