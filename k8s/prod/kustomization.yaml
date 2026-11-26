@@ -15,6 +15,9 @@ helmCharts:
         repository: ghcr.io/prefeitura-rio/ai-gateway
         tag: stable
 
+      # Produção roda com 2 réplicas da API desde antes do base-chart.
+      replicaCount: 2
+
       podLabels:
         app: ai-gateway
 
