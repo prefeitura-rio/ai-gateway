@@ -3,7 +3,11 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -124,9 +128,12 @@ type CacheInterface interface {
 // NewRedisService creates a new Redis service with connection pooling
 func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, error) {
 	// Parse Redis DSN for main connection
+	if err := validateRedisDSN(cfg.Redis.DSN); err != nil {
+		return nil, fmt.Errorf("failed to parse Redis DSN: %w", err)
+	}
 	opts, err := redis.ParseURL(cfg.Redis.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Redis DSN: %w", err)
+		return nil, fmt.Errorf("failed to parse Redis DSN: %w", redactURLError(err))
 	}
 
 	// Configure connection pool
@@ -149,8 +156,10 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
+	// Never log the DSN itself: it carries the Redis credentials.
 	logger.WithFields(logrus.Fields{
-		"dsn":       cfg.Redis.DSN,
+		"addr":      opts.Addr,
+		"db":        opts.DB,
 		"pool_size": cfg.Redis.PoolSize,
 		"min_idle":  cfg.Redis.MinIdleConnections,
 		"max_idle":  cfg.Redis.MaxIdleConnections,
@@ -164,6 +173,60 @@ func NewRedisService(cfg *config.Config, logger *logrus.Logger) (*RedisService, 
 			LastResetTime: time.Now(),
 		},
 	}, nil
+}
+
+// errInvalidURL replaces a net/url parse error of a connection URL.
+var errInvalidURL = errors.New("invalid URL (details omitted: the URL may carry credentials; percent-encode '/', '?', '#' and '@' in the username and password)")
+
+// validateRedisDSN refuses, without quoting it, a DSN that redis.ParseURL
+// would misread. redis.ParseURL does not check the port, so an unescaped '/',
+// '?' or '#' in the password makes the dial (or the parse of the path and
+// query) quote the pieces of the password read as host, port, path or query.
+func validateRedisDSN(dsn string) error {
+	if authorityCutShort(dsn) {
+		return errInvalidURL
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return redactURLError(err)
+	}
+	if p := u.Port(); p != "" {
+		port, err := strconv.Atoi(p)
+		if err != nil || port < 1 || port > 65535 {
+			return errInvalidURL
+		}
+	}
+	return nil
+}
+
+// authorityCutShort reports whether an '@' follows the end of the authority
+// of a connection URL. net/url ends the authority at the first '/', '?' or
+// '#', so an '@' after it means the userinfo holds one of them unescaped: the
+// host and the port net/url reads are then pieces of the username and the
+// password, and a dial error would quote them.
+func authorityCutShort(rawURL string) bool {
+	_, rest, ok := strings.Cut(rawURL, "://")
+	if !ok {
+		return false
+	}
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		return false
+	}
+	return strings.Contains(rest[end:], "@")
+}
+
+// redactURLError replaces a net/url parse error with errInvalidURL, since a
+// connection URL (REDIS_DSN, RABBITMQ_URL) may carry a password. Neither the
+// URL nor the reason is kept: an unescaped '/', '?' or '#' in the password
+// makes net/url read part of it as the port, and an invalid escape is quoted,
+// so the reason itself can carry a piece of the password.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return errInvalidURL
+	}
+	return err
 }
 
 // Get retrieves a value by key

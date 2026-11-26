@@ -178,6 +178,12 @@ func (s *Server) setupRoutes() {
 				message.GET("/debug/task-status", s.messageHandler.HandleDebugTaskStatus)
 			}
 
+			// Enqueue endpoints
+			enqueue := v1.Group("/enqueue")
+			{
+				enqueue.POST("/danfe", s.messageHandler.HandleDanfeEnqueue)
+			}
+
 			// Note: Agent management endpoints removed - were Letta-specific
 			// Google Agent Engine handles agent lifecycle automatically
 		}

@@ -449,6 +449,100 @@ func (h *MessageHandler) HandleDebugTaskStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, debugInfo)
 }
 
+// HandleDanfeEnqueue handles POST /api/v1/enqueue/danfe
+//
+//	@Summary		Enqueue DANFE processing request
+//	@Description	Enqueues a DANFE processing request to the danfe_processing queue
+//	@Tags			DANFE
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body		models.DanfeEnqueueRequest	true	"DANFE processing request"
+//	@Success		201		{object}	map[string]interface{}		"Message enqueued successfully"
+//	@Failure		400		{object}	map[string]interface{}		"Invalid request"
+//	@Failure		500		{object}	map[string]interface{}		"Internal server error"
+//	@Router			/api/v1/enqueue/danfe [post]
+func (h *MessageHandler) HandleDanfeEnqueue(c *gin.Context) {
+	var req models.DanfeEnqueueRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.logger.WithError(err).Error("Invalid request payload")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload", "details": err.Error()})
+		return
+	}
+
+	// Validate callback URL if provided
+	if req.CallbackURL != nil && *req.CallbackURL != "" {
+		if err := validateCallbackURL(*req.CallbackURL); err != nil {
+			h.logger.WithError(err).WithField("callback_url", *req.CallbackURL).Error("Invalid callback URL")
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "Invalid callback URL",
+				"message": err.Error(),
+			})
+			return
+		}
+	}
+
+	ctx := c.Request.Context()
+	logger := h.logger.WithFields(logrus.Fields{
+		"user_number": req.UserNumber,
+		"endpoint":    "danfe_enqueue",
+	})
+
+	// Extract trace headers for distributed tracing
+	var traceHeaders map[string]interface{}
+	if h.tracePropagator != nil {
+		for k, v := range h.tracePropagator.InjectTraceContext(ctx) {
+			if traceHeaders == nil {
+				traceHeaders = make(map[string]interface{})
+			}
+			traceHeaders[k] = v
+		}
+	}
+
+	// Create queue message (same structure as user_messages for consistency)
+	queueMessage := map[string]interface{}{
+		"user_number": req.UserNumber,
+		"message":     req.Message,
+		"metadata":    req.Metadata,
+		"provider":    req.Provider,
+		"callback_url": req.CallbackURL,
+		"timestamp":   time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// Hardcoded queue name for DANFE (not exposed as parameter)
+	targetQueue := "danfe_processing"
+	logger.WithField("target_queue", targetQueue).Info("Routing DANFE request to danfe_processing queue")
+
+	// Queue message for processing with trace headers
+	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var err error
+	if traceHeaders != nil && h.rabbitMQService != nil {
+		if publisherWithHeaders, ok := h.rabbitMQService.(interface {
+			PublishMessageWithHeaders(ctx context.Context, queueName string, message interface{}, headers map[string]interface{}) error
+		}); ok {
+			err = publisherWithHeaders.PublishMessageWithHeaders(ctxTimeout, targetQueue, queueMessage, traceHeaders)
+		} else {
+			err = h.rabbitMQService.PublishMessage(ctxTimeout, targetQueue, queueMessage)
+		}
+	} else {
+		err = h.rabbitMQService.PublishMessage(ctxTimeout, targetQueue, queueMessage)
+	}
+
+	if err != nil {
+		logger.WithError(err).Error("Failed to enqueue DANFE message")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to enqueue message", "details": err.Error()})
+		return
+	}
+
+	logger.Info("DANFE message enqueued successfully")
+	c.JSON(http.StatusCreated, gin.H{
+		"status":  "enqueued",
+		"queue":   targetQueue,
+		"message": "DANFE processing request enqueued successfully",
+	})
+}
+
 // parseRetryCount safely parses retry count from string
 func parseRetryCount(s string) int {
 	// Simple implementation - in production you might want more robust parsing

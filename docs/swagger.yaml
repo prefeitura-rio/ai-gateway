@@ -1,6 +1,27 @@
 basePath: /
 definitions:
-  models.MessageResponse:
+  github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.DanfeEnqueueRequest:
+    properties:
+      callback_url:
+        example: https://example.com/webhook/callback
+        type: string
+      message:
+        example: gs://bucket/file.pdf
+        type: string
+      metadata:
+        additionalProperties: true
+        type: object
+      provider:
+        example: vertex_ai
+        type: string
+      user_number:
+        example: "5521999999999"
+        type: string
+    required:
+    - message
+    - user_number
+    type: object
+  github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.MessageResponse:
     description: Message processing response
     properties:
       data:
@@ -12,7 +33,7 @@ definitions:
         example: completed
         type: string
     type: object
-  models.TaskDebugInfo:
+  github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskDebugInfo:
     properties:
       created_at:
         type: string
@@ -30,11 +51,11 @@ definitions:
       retry_count:
         type: integer
       status:
-        $ref: '#/definitions/models.TaskStatus'
+        $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskStatus'
       updated_at:
         type: string
     type: object
-  models.TaskStatus:
+  github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskStatus:
     enum:
     - pending
     - processing
@@ -46,7 +67,7 @@ definitions:
     - TaskStatusProcessing
     - TaskStatusCompleted
     - TaskStatusFailed
-  models.UserWebhookRequest:
+  github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.UserWebhookRequest:
     properties:
       callback_url:
         example: https://example.com/webhook/callback
@@ -70,7 +91,7 @@ definitions:
     - message
     - user_number
     type: object
-  models.WebhookResponse:
+  github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.WebhookResponse:
     properties:
       message_id:
         example: 123e4567-e89b-12d3-a456-426614174000
@@ -96,6 +117,39 @@ info:
   title: EAí Agent Gateway API
   version: 0.1.0
 paths:
+  /api/v1/enqueue/danfe:
+    post:
+      consumes:
+      - application/json
+      description: Enqueues a DANFE processing request to the danfe_processing queue
+      parameters:
+      - description: DANFE processing request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.DanfeEnqueueRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Message enqueued successfully
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Invalid request
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: Internal server error
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Enqueue DANFE processing request
+      tags:
+      - DANFE
   /api/v1/message/debug/task-status:
     get:
       consumes:
@@ -113,7 +167,7 @@ paths:
         "200":
           description: Task debug information
           schema:
-            $ref: '#/definitions/models.TaskDebugInfo'
+            $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskDebugInfo'
         "400":
           description: Invalid request or message ID format
           schema:
@@ -149,11 +203,11 @@ paths:
         "200":
           description: Message completed or failed
           schema:
-            $ref: '#/definitions/models.MessageResponse'
+            $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.MessageResponse'
         "202":
           description: Message still processing
           schema:
-            $ref: '#/definitions/models.MessageResponse'
+            $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.MessageResponse'
         "400":
           description: Invalid request or message ID format
           schema:
@@ -183,14 +237,14 @@ paths:
         name: request
         required: true
         schema:
-          $ref: '#/definitions/models.UserWebhookRequest'
+          $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.UserWebhookRequest'
       produces:
       - application/json
       responses:
         "202":
           description: Message queued successfully
           schema:
-            $ref: '#/definitions/models.WebhookResponse'
+            $ref: '#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.WebhookResponse'
         "400":
           description: Invalid request
           schema:

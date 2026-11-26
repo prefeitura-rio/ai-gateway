@@ -3,8 +3,11 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -39,6 +42,9 @@ type ChannelPool struct {
 	config     *config.Config
 }
 
+// errRabbitMQShutdown is returned by connect once Close has been called.
+var errRabbitMQShutdown = errors.New("RabbitMQ service is shut down")
+
 // RabbitMQService handles RabbitMQ operations with connection management
 type RabbitMQService struct {
 	config      *config.Config
@@ -51,11 +57,16 @@ type RabbitMQService struct {
 	// Channel pool for concurrent publishing
 	channelPool *ChannelPool
 
-	// Connection monitoring
+	// Connection monitoring. connect() replaces the close notification
+	// channels on every (re)connection; notifyMu guards them so that
+	// handleReconnect never reads them while they are being replaced. It is
+	// separate from mutex because Close() holds mutex while it talks to the
+	// broker, and handleReconnect must keep draining notifications meanwhile.
+	notifyMu        sync.Mutex
 	notifyConnClose chan *amqp.Error
 	notifyChanClose chan *amqp.Error
 	notifyReconnect chan bool
-	isShutdown      bool
+	isShutdown      atomic.Bool
 
 	// Circuit breaker state
 	circuitState     CircuitState
@@ -115,8 +126,46 @@ func NewRabbitMQService(cfg *config.Config, logger *logrus.Logger) (*RabbitMQSer
 	// Setup auto-reconnection
 	go service.handleReconnect()
 
-	logger.WithField("url", cfg.RabbitMQ.URL).Info("RabbitMQ service initialized successfully")
+	// Never log RABBITMQ_URL itself: it carries the RabbitMQ credentials.
+	logger.WithFields(rabbitMQLogFields(cfg.RabbitMQ.URL)).Info("RabbitMQ service initialized successfully")
 	return service, nil
+}
+
+// rabbitMQLogFields describes the broker by host, port and vhost only, leaving
+// out the username and password that RABBITMQ_URL carries.
+func rabbitMQLogFields(rawURL string) logrus.Fields {
+	uri, err := amqp.ParseURI(rawURL)
+	if err != nil {
+		return logrus.Fields{}
+	}
+	return logrus.Fields{
+		"host":  uri.Host,
+		"port":  uri.Port,
+		"vhost": uri.Vhost,
+	}
+}
+
+// validateRabbitMQURL refuses, without quoting it, a URL that amqp.Dial would
+// misread. An unescaped '/', '?' or '#' in the password makes its leading
+// characters look like the port: net/url quotes them, amqp.ParseURI quotes a
+// port out of range, and the dialer quotes a port above 65535 and, in a dial
+// error, any port of a host that resolves.
+func validateRabbitMQURL(rawURL string) error {
+	if authorityCutShort(rawURL) {
+		return errInvalidURL
+	}
+	uri, err := amqp.ParseURI(rawURL)
+	if err != nil {
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) {
+			return errInvalidURL
+		}
+		return redactURLError(err)
+	}
+	if uri.Port < 1 || uri.Port > 65535 {
+		return errInvalidURL
+	}
+	return nil
 }
 
 // checkCircuitBreaker checks if the circuit breaker allows the operation
@@ -346,10 +395,20 @@ func (r *RabbitMQService) connect() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	// Close() sets isShutdown under mutex, so checking it here, with mutex
+	// held, keeps a reconnection that was already waiting from dialing the
+	// broker again after Close.
+	if r.isShutdown.Load() {
+		return errRabbitMQShutdown
+	}
+
 	// Connect to RabbitMQ
+	if err := validateRabbitMQURL(r.config.RabbitMQ.URL); err != nil {
+		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+	}
 	conn, err := amqp.Dial(r.config.RabbitMQ.URL)
 	if err != nil {
-		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+		return fmt.Errorf("failed to connect to RabbitMQ: %w", redactURLError(err))
 	}
 
 	// Create main channel (for topology setup and health checks)
@@ -366,15 +425,20 @@ func (r *RabbitMQService) connect() error {
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
+	r.notifyMu.Lock()
 	r.connection = conn
 	r.channel = ch
 	r.isConnected = true
 
-	// Setup connection monitoring
-	r.notifyConnClose = make(chan *amqp.Error)
-	r.notifyChanClose = make(chan *amqp.Error)
+	// Setup connection monitoring. The channels are buffered (as amqp091-go
+	// recommends for NotifyClose): the library sends the close error while
+	// holding its shutdown lock, so with no reader (Close already running, or
+	// handleReconnect busy reconnecting) an unbuffered send would block forever.
+	r.notifyConnClose = make(chan *amqp.Error, 1)
+	r.notifyChanClose = make(chan *amqp.Error, 1)
 	r.connection.NotifyClose(r.notifyConnClose)
 	r.channel.NotifyClose(r.notifyChanClose)
+	r.notifyMu.Unlock()
 
 	// Setup exchanges and queues
 	if err := r.setupTopology(); err != nil {
@@ -442,16 +506,26 @@ func (r *RabbitMQService) setupTopology() error {
 		return fmt.Errorf("failed to declare user messages queue: %w", err)
 	}
 
-	// Declare dead letter queues
-	queues := []string{
-		r.config.RabbitMQ.UserQueue,
-		r.config.RabbitMQ.UserMessagesQueue,
+	// Declare DANFE processing queue
+	if err := r.declareQueueWithDLX("danfe_processing"); err != nil {
+		return fmt.Errorf("failed to declare DANFE processing queue: %w", err)
 	}
 
-	for _, queue := range queues {
-		if err := r.declareDLQ(queue + "_dlq"); err != nil {
-			return fmt.Errorf("failed to declare DLQ for %s: %w", queue, err)
-		}
+	// Declare dead letter queues
+	if err := r.declareDLQ(r.config.RabbitMQ.UserQueue+"_dlq", nil); err != nil {
+		return fmt.Errorf("failed to declare DLQ for %s: %w", r.config.RabbitMQ.UserQueue, err)
+	}
+
+	if err := r.declareDLQ(r.config.RabbitMQ.UserMessagesQueue+"_dlq", nil); err != nil {
+		return fmt.Errorf("failed to declare DLQ for %s: %w", r.config.RabbitMQ.UserMessagesQueue, err)
+	}
+
+	// DANFE DLQ with 48 hours TTL
+	danfeDLQArgs := amqp.Table{
+		"x-message-ttl": int32(172800000), // 48 hours in milliseconds
+	}
+	if err := r.declareDLQ("danfe_processing_dlq", danfeDLQArgs); err != nil {
+		return fmt.Errorf("failed to declare DLQ for danfe_processing: %w", err)
 	}
 
 	r.logger.Info("RabbitMQ topology setup completed")
@@ -463,7 +537,7 @@ func (r *RabbitMQService) declareQueueWithDLX(queueName string) error {
 	args := amqp.Table{
 		"x-dead-letter-exchange":    r.config.RabbitMQ.DLXExchange,
 		"x-dead-letter-routing-key": queueName + "_dlq",
-		"x-message-ttl":             300000, // 5 minutes TTL
+		"x-message-ttl":             1200000, // 20 minutes TTL
 	}
 
 	_, err := r.channel.QueueDeclare(
@@ -488,15 +562,15 @@ func (r *RabbitMQService) declareQueueWithDLX(queueName string) error {
 	)
 }
 
-// declareDLQ declares a dead letter queue
-func (r *RabbitMQService) declareDLQ(queueName string) error {
+// declareDLQ declares a dead letter queue with optional arguments (e.g., TTL)
+func (r *RabbitMQService) declareDLQ(queueName string, args amqp.Table) error {
 	_, err := r.channel.QueueDeclare(
 		queueName, // name
 		true,      // durable
 		false,     // delete when unused
 		false,     // exclusive
 		false,     // no-wait
-		nil,       // arguments
+		args,      // arguments (can include x-message-ttl, etc.)
 	)
 	if err != nil {
 		return err
@@ -806,9 +880,16 @@ func (r *RabbitMQService) PublishPriorityMessage(ctx context.Context, queueName 
 // handleReconnect monitors connection and handles automatic reconnection
 func (r *RabbitMQService) handleReconnect() {
 	for {
+		// Take the notification channels of the current connection at the
+		// start of every round: a reconnection replaces them.
+		r.notifyMu.Lock()
+		notifyConnClose := r.notifyConnClose
+		notifyChanClose := r.notifyChanClose
+		r.notifyMu.Unlock()
+
 		select {
-		case err := <-r.notifyConnClose:
-			if r.isShutdown {
+		case err := <-notifyConnClose:
+			if r.isShutdown.Load() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ connection lost, attempting to reconnect")
@@ -817,8 +898,8 @@ func (r *RabbitMQService) handleReconnect() {
 			r.mutex.Unlock()
 			r.reconnect()
 
-		case err := <-r.notifyChanClose:
-			if r.isShutdown {
+		case err := <-notifyChanClose:
+			if r.isShutdown.Load() {
 				return
 			}
 			r.logger.WithError(err).Error("RabbitMQ channel lost, attempting to reconnect")
@@ -828,7 +909,7 @@ func (r *RabbitMQService) handleReconnect() {
 			r.reconnect()
 
 		case <-r.notifyReconnect:
-			if r.isShutdown {
+			if r.isShutdown.Load() {
 				return
 			}
 			r.logger.Info("Manual reconnection requested")
@@ -843,7 +924,7 @@ func (r *RabbitMQService) reconnect() {
 	maxRetries := r.config.RabbitMQ.MaxRetries
 
 	for retryCount < maxRetries {
-		if r.isShutdown {
+		if r.isShutdown.Load() {
 			return
 		}
 
@@ -858,6 +939,9 @@ func (r *RabbitMQService) reconnect() {
 		time.Sleep(delay)
 
 		if err := r.connect(); err != nil {
+			if errors.Is(err, errRabbitMQShutdown) {
+				return
+			}
 			r.logger.WithError(err).WithField("retry_count", retryCount+1).Error("Failed to reconnect to RabbitMQ")
 			retryCount++
 			continue
@@ -909,7 +993,7 @@ func (r *RabbitMQService) Close() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	r.isShutdown = true
+	r.isShutdown.Store(true)
 	r.isConnected = false
 
 	// Close channel pool first

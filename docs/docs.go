@@ -27,6 +27,55 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/api/v1/enqueue/danfe": {
+            "post": {
+                "description": "Enqueues a DANFE processing request to the danfe_processing queue",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "DANFE"
+                ],
+                "summary": "Enqueue DANFE processing request",
+                "parameters": [
+                    {
+                        "description": "DANFE processing request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.DanfeEnqueueRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Message enqueued successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/message/debug/task-status": {
             "get": {
                 "description": "Get detailed debug information about message processing task status",
@@ -53,7 +102,7 @@ const docTemplate = `{
                     "200": {
                         "description": "Task debug information",
                         "schema": {
-                            "$ref": "#/definitions/models.TaskDebugInfo"
+                            "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskDebugInfo"
                         }
                     },
                     "400": {
@@ -106,13 +155,13 @@ const docTemplate = `{
                     "200": {
                         "description": "Message completed or failed",
                         "schema": {
-                            "$ref": "#/definitions/models.MessageResponse"
+                            "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.MessageResponse"
                         }
                     },
                     "202": {
                         "description": "Message still processing",
                         "schema": {
-                            "$ref": "#/definitions/models.MessageResponse"
+                            "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.MessageResponse"
                         }
                     },
                     "400": {
@@ -159,7 +208,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/models.UserWebhookRequest"
+                            "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.UserWebhookRequest"
                         }
                     }
                 ],
@@ -167,7 +216,7 @@ const docTemplate = `{
                     "202": {
                         "description": "Message queued successfully",
                         "schema": {
-                            "$ref": "#/definitions/models.WebhookResponse"
+                            "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.WebhookResponse"
                         }
                     },
                     "400": {
@@ -275,7 +324,36 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "models.MessageResponse": {
+        "github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.DanfeEnqueueRequest": {
+            "type": "object",
+            "required": [
+                "message",
+                "user_number"
+            ],
+            "properties": {
+                "callback_url": {
+                    "type": "string",
+                    "example": "https://example.com/webhook/callback"
+                },
+                "message": {
+                    "type": "string",
+                    "example": "gs://bucket/file.pdf"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "provider": {
+                    "type": "string",
+                    "example": "vertex_ai"
+                },
+                "user_number": {
+                    "type": "string",
+                    "example": "5521999999999"
+                }
+            }
+        },
+        "github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.MessageResponse": {
             "description": "Message processing response",
             "type": "object",
             "properties": {
@@ -292,7 +370,7 @@ const docTemplate = `{
                 }
             }
         },
-        "models.TaskDebugInfo": {
+        "github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskDebugInfo": {
             "type": "object",
             "properties": {
                 "created_at": {
@@ -318,14 +396,14 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "status": {
-                    "$ref": "#/definitions/models.TaskStatus"
+                    "$ref": "#/definitions/github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskStatus"
                 },
                 "updated_at": {
                     "type": "string"
                 }
             }
         },
-        "models.TaskStatus": {
+        "github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.TaskStatus": {
             "type": "string",
             "enum": [
                 "pending",
@@ -340,7 +418,7 @@ const docTemplate = `{
                 "TaskStatusFailed"
             ]
         },
-        "models.UserWebhookRequest": {
+        "github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.UserWebhookRequest": {
             "type": "object",
             "required": [
                 "message",
@@ -373,7 +451,7 @@ const docTemplate = `{
                 }
             }
         },
-        "models.WebhookResponse": {
+        "github_com_prefeitura-rio_app-eai-agent-gateway_internal_models.WebhookResponse": {
             "type": "object",
             "properties": {
                 "message_id": {
